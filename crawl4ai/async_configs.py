@@ -1514,7 +1514,9 @@ class CrawlerRunConfig():
                                                 the initial raw HTML to the selected element, while this will only affect 
                                                 the extraction and Markdown generation.
                                     Default: None
-        excluded_tags (list of str or None): List of HTML tags to exclude from processing.
+        excluded_tags (list of str or None): HTML tags removed before markdown
+            conversion. GrantGunner default is ["nav", "footer"] so menus and
+            footers are not returned as page content. Pass [] to keep them.
                                              Default: None.
         excluded_selector (str or None): CSS selector to exclude from processing.
                                          Default: None.
@@ -1870,7 +1872,8 @@ class CrawlerRunConfig():
         self.only_text = only_text
         self.css_selector = css_selector
         self.target_elements = target_elements or []
-        self.excluded_tags = excluded_tags or []
+        # None means the GrantGunner default. An explicit [] keeps nav and footer.
+        self.excluded_tags = ["nav", "footer"] if excluded_tags is None else excluded_tags
         self.excluded_selector = excluded_selector or ""
         self.keep_data_attributes = keep_data_attributes
         self.keep_attrs = keep_attrs or []
