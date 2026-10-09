@@ -56,12 +56,14 @@ class TestUntrustedForbiddenFields:
             ("proxy_config", {"server": "http://evil"}),
             ("base_url", "http://evil"),
             ("simulate_user", True),
+            ("override_navigator", True),
             ("magic", True),
             ("process_in_browser", True),
             ("session_id", "shared"),
         ],
     )
-    def test_crawler_power_field_rejected(self, field, value):
+    def test_crawler_power_field_rejected(self, field, value, monkeypatch):
+        monkeypatch.delenv("CRAWL4AI_ALLOW_STEALTH_FIELDS", raising=False)
         with pytest.raises(UntrustedConfigError):
             CrawlerRunConfig.load({field: value}, provenance=U)
 
@@ -97,6 +99,48 @@ class TestUntrustedForbiddenFields:
         outright rather than scrubbed by an always-incomplete denylist."""
         with pytest.raises(UntrustedConfigError):
             BrowserConfig.load({"extra_args": payload}, provenance=U)
+
+
+class TestStealthFieldsOptIn:
+    """Private GrantGunner servers set CRAWL4AI_ALLOW_STEALTH_FIELDS to let the
+    HTTP API pass the same stealth knobs the SDK already accepts."""
+
+    def test_stealth_fields_stay_forbidden_by_default(self, monkeypatch):
+        monkeypatch.delenv("CRAWL4AI_ALLOW_STEALTH_FIELDS", raising=False)
+        with pytest.raises(UntrustedConfigError):
+            CrawlerRunConfig.load({"magic": True, "cache_mode": "bypass"}, provenance=U)
+
+    def test_stealth_fields_accepted_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("CRAWL4AI_ALLOW_STEALTH_FIELDS", "true")
+        c = CrawlerRunConfig.load(
+            {
+                "type": "CrawlerRunConfig",
+                "params": {
+                    "cache_mode": "bypass",
+                    "magic": True,
+                    "simulate_user": True,
+                    "override_navigator": True,
+                },
+            },
+            provenance=U,
+        )
+        assert c.magic is True
+        assert c.simulate_user is True
+        assert c.override_navigator is True
+
+        b = BrowserConfig.load(
+            {
+                "type": "BrowserConfig",
+                "params": {"headless": True, "use_managed_browser": True},
+            },
+            provenance=U,
+        )
+        assert b.use_managed_browser is True
+
+    def test_js_code_stays_forbidden_when_stealth_enabled(self, monkeypatch):
+        monkeypatch.setenv("CRAWL4AI_ALLOW_STEALTH_FIELDS", "true")
+        with pytest.raises(UntrustedConfigError):
+            CrawlerRunConfig.load({"js_code": "alert(1)"}, provenance=U)
 
 
 class TestUntrustedTypeGate:

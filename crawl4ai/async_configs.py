@@ -198,8 +198,21 @@ UNTRUSTED_ALLOWED_TYPES = {
     "CacheMode", "MatchMode", "DisplayMode",
 }
 
+# GrantGunner fork: the HTTP API may opt in to the stealth knobs the in-process
+# SDK already has. Set CRAWL4AI_ALLOW_STEALTH_FIELDS=true on a private server.
+# Left unset, these stay forbidden, same as upstream.
+_STEALTH_CRAWLER_FIELDS = {"simulate_user", "override_navigator", "magic"}
+_STEALTH_BROWSER_FIELDS = {"use_managed_browser"}
+
+
+def _stealth_fields_allowed() -> bool:
+    return os.getenv("CRAWL4AI_ALLOW_STEALTH_FIELDS", "").strip().lower() in {"1", "true", "yes"}
+
+
 # Fields that must NEVER come from an untrusted body. Presence => 400 (loud), so
 # a client smuggling these gets an explicit error rather than a silent drop.
+# simulate_user, override_navigator, and magic are in this set unless
+# CRAWL4AI_ALLOW_STEALTH_FIELDS is enabled.
 UNTRUSTED_FORBIDDEN_FIELDS = {
     "BrowserConfig": {
         "proxy", "proxy_config", "extra_args", "user_data_dir", "channel",
@@ -338,10 +351,31 @@ def _max_timeout_ms() -> int:
     return ceiling
 
 
+def _forbidden_fields_for(type_name: str) -> set:
+    forbidden = set(UNTRUSTED_FORBIDDEN_FIELDS.get(type_name, set()))
+    if _stealth_fields_allowed() and type_name == "CrawlerRunConfig":
+        forbidden -= _STEALTH_CRAWLER_FIELDS
+    return forbidden
+
+
+def _allowlist_for(type_name: str):
+    allowlist = UNTRUSTED_FIELD_ALLOWLIST.get(type_name)  # None => keep all non-forbidden
+    if allowlist is None or not _stealth_fields_allowed():
+        return allowlist
+    extra = set()
+    if type_name == "CrawlerRunConfig":
+        extra = _STEALTH_CRAWLER_FIELDS
+    elif type_name == "BrowserConfig":
+        extra = _STEALTH_BROWSER_FIELDS
+    if not extra:
+        return allowlist
+    return set(allowlist) | extra
+
+
 def _filter_untrusted_fields(type_name: str, params: dict) -> dict:
     """Drop non-allowlisted fields and raise on forbidden (power) fields."""
-    forbidden = UNTRUSTED_FORBIDDEN_FIELDS.get(type_name, set())
-    allowlist = UNTRUSTED_FIELD_ALLOWLIST.get(type_name)  # None => keep all non-forbidden
+    forbidden = _forbidden_fields_for(type_name)
+    allowlist = _allowlist_for(type_name)
     out = {}
     for key, value in params.items():
         if key in UNTRUSTED_GLOBAL_FORBIDDEN_FIELDS or key in forbidden:
