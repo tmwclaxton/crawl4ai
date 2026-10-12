@@ -15,3 +15,5 @@ mcp>=1.18.0,<2
 websockets>=15.0.1
 httpx[http2]>=0.27.2
 pypdf>=6.0.0
+python-docx>=1.1.2
+openpyxl>=3.1.5

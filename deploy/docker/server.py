@@ -258,12 +258,18 @@ async def _lifespan_work():
     # Start background tasks
     app.state.janitor = asyncio.create_task(janitor())
     app.state.timeline_updater = asyncio.create_task(_timeline_updater())
+    page_monitor = getattr(app.state, "page_monitor", None)
+    if page_monitor is not None:
+        app.state.page_monitor_task = asyncio.create_task(page_monitor.run_forever())
 
     yield
 
     # Cleanup
     app.state.janitor.cancel()
     app.state.timeline_updater.cancel()
+    monitor_task = getattr(app.state, "page_monitor_task", None)
+    if monitor_task is not None:
+        monitor_task.cancel()
     app.state.artifact_janitor.cancel()
     try:
         await app.state.egress_proxy.stop()
@@ -1201,6 +1207,10 @@ async def get_context(
 
     return JSONResponse(results)
 
+
+from tool_routes import attach_tool_routes
+
+attach_tool_routes(app, limiter, token_dep, config, get_default_browser_config, redis)
 
 # attach MCP layer (adds /mcp, /mcp/ws, /mcp/sse, /mcp/schema)
 print(f"MCP server running on {config['app']['host']}:{config['app']['port']}")

@@ -30,6 +30,7 @@ _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _KIND = {
     "png": (".png", "image/png"),
     "pdf": (".pdf", "application/pdf"),
+    "zip": (".zip", "application/zip"),
 }
 
 

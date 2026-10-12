@@ -117,6 +117,85 @@ class PDFRequest(BaseModel):
     )
 
 
+class ScrapeRequest(BaseModel):
+    """One or more public pages, in the same shape agents expect from a scrape tool."""
+    urls: List[str] = Field(..., min_length=1, max_length=10)
+    formats: List[str] = Field(default_factory=lambda: ["markdown"])
+    only_main_content: bool = True
+    wait_for: Optional[int] = Field(None, ge=0, le=30000, description="Milliseconds to wait after load")
+    include_tags: List[str] = Field(default_factory=list)
+    exclude_tags: List[str] = Field(default_factory=list)
+    query: Optional[str] = None
+
+
+class MapRequest(BaseModel):
+    """Discover URLs on a site from its sitemap and, optionally, Common Crawl."""
+    url: str
+    limit: int = Field(50, ge=1, le=200)
+    search: Optional[str] = None
+    sitemap: str = Field("include", description="include, skip, or only")
+    include_subdomains: bool = False
+
+
+class SearchRequest(BaseModel):
+    """Web search merged from several engines. A blocked engine is skipped."""
+    query: str = Field(..., min_length=1, max_length=400)
+    limit: int = Field(5, ge=1, le=20)
+    sources: str = Field("web", description="web or news")
+    categories: Optional[str] = None
+    scrape: bool = False
+
+
+class SiteCrawlRequest(BaseModel):
+    """Crawl one site section. This is the friendly crawl, not the raw /crawl config."""
+    url: str
+    limit: int = Field(10, ge=1, le=100)
+    max_depth: int = Field(2, ge=0, le=5)
+    include_paths: List[str] = Field(default_factory=list)
+    exclude_paths: List[str] = Field(default_factory=list)
+
+
+class AgentRequest(BaseModel):
+    """Extract structured data from a few pages. Does not click or log in."""
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    urls: List[str] = Field(default_factory=list)
+    schema_: Optional[Dict[str, Any]] = Field(None, alias="schema")
+
+    model_config = {"populate_by_name": True}
+
+
+class ParseRequest(BaseModel):
+    """Turn an uploaded document into markdown. The file is base64."""
+    filename: str
+    data_base64: str
+    summary: bool = False
+    query: Optional[str] = None
+
+
+class DownloadRequest(BaseModel):
+    """Map a site and save a zip of page files in the artifact store."""
+    url: str
+    limit: int = Field(5, ge=1, le=20)
+    search: Optional[str] = None
+    include_paths: List[str] = Field(default_factory=list)
+    exclude_paths: List[str] = Field(default_factory=list)
+    formats: List[str] = Field(default_factory=lambda: ["markdown"])
+    only_main_content: bool = True
+
+
+class MonitorCreateRequest(BaseModel):
+    """Watch pages and report when the content actually changes."""
+    name: str = Field(..., min_length=1, max_length=120)
+    urls: List[str] = Field(..., min_length=1, max_length=20)
+    schedule: str = "hourly"
+    goal: Optional[str] = None
+    webhook: Optional[str] = None
+
+
+class MonitorIdRequest(BaseModel):
+    id: str
+
+
 class JSEndpointRequest(BaseModel):
     url: str
     scripts: List[str] = Field(
