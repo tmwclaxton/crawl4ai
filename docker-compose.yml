@@ -9,6 +9,11 @@ x-base-config: &base-config
   environment:
     # Auth token passthrough from the host shell (overwrites .llm.env).
     - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:-}
+    # Faster pages, and Firecrawl only when the browser comes back empty.
+    - CRAWL4AI_FIRECRAWL_FALLBACK=${CRAWL4AI_FIRECRAWL_FALLBACK:-false}
+    - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
+    - CRAWL4AI_PAGE_TIMEOUT_MS=${CRAWL4AI_PAGE_TIMEOUT_MS:-15000}
+    - CRAWL4AI_DISABLE_RATE_LIMITER=${CRAWL4AI_DISABLE_RATE_LIMITER:-true}
     # Uncomment to set default environment variables (will overwrite .llm.env)
     # - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     # - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}

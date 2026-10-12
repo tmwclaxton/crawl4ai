@@ -692,11 +692,14 @@ async def handle_crawl_request(
         from governor import clamp_deep_crawl
         clamp_deep_crawl(crawler_config)
 
+        from firecrawl_fallback import rate_limiter_disabled
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
-            rate_limiter=RateLimiter(
-                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
-            ) if config["crawler"]["rate_limiter"]["enabled"] else None
+            rate_limiter=None if rate_limiter_disabled() else (
+                RateLimiter(
+                    base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+                ) if config["crawler"]["rate_limiter"]["enabled"] else None
+            )
         )
         
         from crawler_pool import get_crawler, release_crawler
@@ -744,6 +747,9 @@ async def handle_crawl_request(
                     if current_value is None or current_value == "":
                         setattr(crawler_config, key, value)
             effective_config = crawler_config
+
+        from firecrawl_fallback import apply_page_timeout_cap
+        apply_page_timeout_cap(effective_config)
 
         results = []
         func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
@@ -809,7 +815,10 @@ async def handle_crawl_request(
                     "success": False,
                     "error_message": str(e)
                 })
-            
+
+        from firecrawl_fallback import fill_failed_results
+        processed_results = await fill_failed_results(processed_results)
+
         response = {
             "success": True,
             "results": processed_results,
