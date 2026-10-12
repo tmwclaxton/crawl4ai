@@ -14,6 +14,8 @@ x-base-config: &base-config
     - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
     - CRAWL4AI_PAGE_TIMEOUT_MS=${CRAWL4AI_PAGE_TIMEOUT_MS:-15000}
     - CRAWL4AI_DISABLE_RATE_LIMITER=${CRAWL4AI_DISABLE_RATE_LIMITER:-true}
+    # Public origin used in the MCP OAuth discovery documents.
+    - CRAWL4AI_PUBLIC_BASE_URL=${CRAWL4AI_PUBLIC_BASE_URL:-https://crawl4ai.grantgunner.org}
     # Uncomment to set default environment variables (will overwrite .llm.env)
     # - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     # - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}

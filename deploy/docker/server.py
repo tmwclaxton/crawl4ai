@@ -194,7 +194,21 @@ def _install_pdf_egress_policy() -> None:
 
 
 @asynccontextmanager
+async def _null_async():
+    yield
+
+
+@asynccontextmanager
 async def lifespan(_: FastAPI):
+    manager = getattr(app.state, "mcp_session_manager", None)
+    runner = manager.run() if manager is not None else _null_async()
+    async with runner:
+        async with _lifespan_work():
+            yield
+
+
+@asynccontextmanager
+async def _lifespan_work():
     from crawler_pool import init_permanent
     from monitor import MonitorStats
     import monitor as monitor_module
@@ -413,7 +427,13 @@ async def add_security_headers(request: Request, call_next):
     for k, v in SECURITY_BASELINE_HEADERS.items():
         resp.headers.setdefault(k, v)
     path = request.url.path
-    if not any(path.startswith(p) for p in _UI_PREFIXES):
+    if path.startswith("/oauth"):
+        # The API-key prompt posts back to this host. The default CSP blocks form submits.
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'"
+        )
+    elif not any(path.startswith(p) for p in _UI_PREFIXES):
         resp.headers.setdefault("Content-Security-Policy", STRICT_CSP)
     if config["security"].get("https_redirect"):
         resp.headers.setdefault(
@@ -437,14 +457,16 @@ def _current_api_token() -> str:
     )
 
 
+from mcp_oauth import OAUTH_PUBLIC_PATHS, OAUTH_PUBLIC_PREFIXES, attach_oauth
+
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_token,
     # Exact paths only: "/monitor" reaches the redirect above, while every
     # "/monitor/*" API route (incl. /monitor/ws and the admin actions) keeps
     # requiring a credential.
-    public_paths={HEALTH_PATH, "/token", "/", "/monitor"},
-    public_prefixes=_UI_PREFIXES,
+    public_paths={HEALTH_PATH, "/token", "/", "/monitor", *OAUTH_PUBLIC_PATHS},
+    public_prefixes=_UI_PREFIXES + OAUTH_PUBLIC_PREFIXES,
 )
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
@@ -1180,8 +1202,9 @@ async def get_context(
     return JSONResponse(results)
 
 
-# attach MCP layer (adds /mcp/ws, /mcp/sse, /mcp/schema)
+# attach MCP layer (adds /mcp, /mcp/ws, /mcp/sse, /mcp/schema)
 print(f"MCP server running on {config['app']['host']}:{config['app']['port']}")
+attach_oauth(app)
 attach_mcp(
     app,
     # Internal MCP tool calls go over loopback to our own gated endpoints,

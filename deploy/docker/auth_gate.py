@@ -106,6 +106,17 @@ class AuthGateMiddleware:
                 return vals[0]
         return None
 
+    def _www_authenticate(self, scope) -> bytes:
+        """MCP clients discover OAuth from this header. Other routes stay a plain 401."""
+        path = scope.get("path", "") or ""
+        if path != "/mcp" and not path.startswith("/mcp/"):
+            return b'Bearer realm="mcp"'
+        from mcp_oauth import resource_metadata_url
+
+        url = resource_metadata_url(scope, path)
+        value = f'Bearer realm="mcp", resource_metadata="{url}"'
+        return value.encode("latin-1")
+
     async def _reject(self, scope, receive, send):
         if scope["type"] == "websocket":
             # Close before accept; 4401 = application "unauthorized".
@@ -118,7 +129,7 @@ class AuthGateMiddleware:
                 "status": 401,
                 "headers": [
                     (b"content-type", b"application/json"),
-                    (b"www-authenticate", b"Bearer"),
+                    (b"www-authenticate", self._www_authenticate(scope)),
                     (b"content-length", str(len(body)).encode()),
                 ],
             }

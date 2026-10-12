@@ -1,7 +1,7 @@
 # deploy/docker/mcp_bridge.py
 
 from __future__ import annotations
-import inspect, json, re, anyio
+import inspect, json, os, re, anyio
 from contextlib import suppress
 from typing import Any, Callable, Dict, List, Tuple
 import httpx
@@ -108,6 +108,10 @@ def attach_mcp(
 
         key = fn.__mcp_name__ or re.sub(r"[/{}}]", "_", route.path).strip("_")
 
+        # execute_js is an RCE footgun and is off unless the operator opts in.
+        if key == "execute_js" and os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lower() != "true":
+            continue
+
         # if kind == "tool":
         #     tools[key] = _make_http_proxy(base_url, route)
         if kind == "tool":
@@ -136,6 +140,11 @@ def attach_mcp(
         out = []
         for k, (proxy, orig_fn) in tools.items():
             desc   = getattr(orig_fn, "__mcp_description__", None) or inspect.getdoc(orig_fn) or ""
+            if k == "md":
+                desc = (
+                    "Read one public http(s) page as markdown. "
+                    "Pass f=raw for the full page. f=fit is a readability extract and drops a lot of real content."
+                )
             schema = getattr(orig_fn, "__mcp_schema__", None) or _schema(_body_model(orig_fn))
             out.append(
                 t.Tool(name=k, description=desc, inputSchema=schema)
@@ -251,6 +260,32 @@ def attach_mcp(
 
     app.routes.append(Route(f"{base}/sse", endpoint=_MCPSseApp()))
     app.routes.append(Mount(f"{base}/messages", app=sse.handle_post_message))
+
+    # Streamable HTTP at /mcp. Cursor and Claude open this URL, get a 401,
+    # and follow the OAuth browser prompt before calling tools.
+    from urllib.parse import urlparse
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    public = os.environ.get("CRAWL4AI_PUBLIC_BASE_URL", "https://crawl4ai.grantgunner.org").strip().rstrip("/")
+    host = urlparse(public).netloc or "crawl4ai.grantgunner.org"
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp,
+        json_response=True,
+        stateless=True,
+        security_settings=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[host, f"{host}:*", "127.0.0.1:*", "localhost:*", "testserver", "testserver:*"],
+            allowed_origins=[public, "http://127.0.0.1:*", "http://localhost:*", "http://testserver", "http://testserver:*"],
+        ),
+    )
+    app.state.mcp_session_manager = session_manager
+
+    class _MCPStreamableApp:
+        async def __call__(self, scope, receive, send):
+            await session_manager.handle_request(scope, receive, send)
+
+    app.routes.append(Route(base, endpoint=_MCPStreamableApp(), methods=["GET", "POST", "DELETE"]))
 
     # ── schema endpoint ───────────────────────────────────────
     @app.get(f"{base}/schema")
