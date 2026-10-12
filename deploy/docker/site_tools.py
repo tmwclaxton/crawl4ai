@@ -22,6 +22,7 @@ SEARCH_COOLDOWN_SECONDS = 180
 AGENT_PAGE_CAP = 8
 DOWNLOAD_PAGE_CAP = 20
 SCRAPE_URL_CAP = 10
+MAP_SEARCH_POOL = 1500
 
 _BLOCK_PHRASES = (
     "captcha",
@@ -148,6 +149,16 @@ def is_nonsense_url(url: str) -> bool:
     return name in _NONSENSE_SUFFIXES
 
 
+def seed_pattern(url: str) -> str:
+    """Keep discovery under the requested path. A bare host stays a whole-site map."""
+    parsed = urlparse(url)
+    path = (parsed.path or "/").rstrip("/")
+    host = (parsed.hostname or "").lower()
+    if not path:
+        return "*"
+    return f"*{host}{path}*"
+
+
 def filter_mapped(
     items: Sequence[Dict[str, Any]],
     *,
@@ -157,6 +168,7 @@ def filter_mapped(
 ) -> List[Dict[str, Any]]:
     host = (urlparse(root).hostname or "").lower()
     bare = host[4:] if host.startswith("www.") else host
+    prefix = (urlparse(root).path or "/").rstrip("/")
     kept = []
     for item in items:
         url = item.get("url") or ""
@@ -164,13 +176,18 @@ def filter_mapped(
             continue
         if is_nonsense_url(url):
             continue
-        item_host = (urlparse(url).hostname or "").lower()
+        parsed = urlparse(url)
+        item_host = (parsed.hostname or "").lower()
         item_bare = item_host[4:] if item_host.startswith("www.") else item_host
         if include_subdomains:
             if item_bare != bare and not item_bare.endswith("." + bare):
                 continue
         elif item_bare != bare:
             continue
+        if prefix:
+            item_path = (parsed.path or "/").rstrip("/")
+            if item_path != prefix and not item_path.startswith(prefix + "/"):
+                continue
         kept.append(item)
         if len(kept) >= limit:
             break
@@ -378,14 +395,16 @@ async def run_map(
     source = seed_source(sitemap)
     config = type("SeedConfig", (), {})()
     config.source = source
-    config.pattern = "*"
+    config.pattern = seed_pattern(url)
     config.live_check = False
-    config.extract_head = bool(search)
+    # Rank the URL text here. Fetching a title for every sitemap URL is too slow,
+    # and the seeder stops collecting once max_urls is hit, before it can score.
+    config.extract_head = False
     config.concurrency = 10
     config.hits_per_sec = 5
     config.force = False
     config.verbose = False
-    config.max_urls = limit if not search else max(limit, 50)
+    config.max_urls = MAP_SEARCH_POOL if search else limit
     config.query = search
     config.score_threshold = None
     config.scoring_method = "bm25"

@@ -28,6 +28,7 @@ from site_tools import (
     path_allowed,
     rank_mapped,
     reset_search_state,
+    seed_pattern,
     run_agent,
     run_map,
     run_scrape,
@@ -209,9 +210,13 @@ def test_run_map_records_the_sitemap_mode_and_drops_nonsense():
     class FakeSeeder:
         def __init__(self):
             self.source = None
+            self.pattern = None
+            self.max_urls = None
 
         async def urls(self, domain, config):
             self.source = config.source
+            self.pattern = config.pattern
+            self.max_urls = config.max_urls
             return [
                 {"url": "https://example.com/docs/auth", "head_data": {"title": "Authentication"}},
                 {"url": "https://example.com/robots.txt", "head_data": {"title": "robots"}},
@@ -228,7 +233,37 @@ def test_run_map_records_the_sitemap_mode_and_drops_nonsense():
         seeder=seeder,
     ))
     assert seeder.source == "sitemap"
+    assert seeder.pattern == "*"
+    assert seeder.max_urls > 10
     assert result["links"] == ["https://example.com/docs/auth"]
+
+
+def test_run_map_keeps_the_requested_path_and_ranks_the_search_term():
+    class FakeSeeder:
+        def __init__(self):
+            self.pattern = None
+
+        async def urls(self, domain, config):
+            self.pattern = config.pattern
+            return [
+                {"url": "https://docs.python.org/3/library/functions.html"},
+                {"url": "https://docs.python.org/3.11/"},
+                {"url": "https://docs.python.org/3/library/constants.html"},
+            ]
+
+    seeder = FakeSeeder()
+    result = asyncio.run(run_map(
+        "https://docs.python.org/3/library/",
+        limit=5,
+        search="constants",
+        sitemap="include",
+        include_subdomains=False,
+        seeder=seeder,
+    ))
+    assert seed_pattern("https://docs.python.org/3/library/") == "*docs.python.org/3/library*"
+    assert seeder.pattern == "*docs.python.org/3/library*"
+    assert result["links"][0].endswith("/constants.html")
+    assert all("/3/library/" in link for link in result["links"])
 
 
 def test_path_filters_and_crawl_clamps():
