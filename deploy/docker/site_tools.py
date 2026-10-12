@@ -22,7 +22,7 @@ SEARCH_COOLDOWN_SECONDS = 180
 AGENT_PAGE_CAP = 8
 DOWNLOAD_PAGE_CAP = 20
 SCRAPE_URL_CAP = 10
-MAP_SEARCH_POOL = 1500
+MAP_SEARCH_POOL = 400
 
 _BLOCK_PHRASES = (
     "captcha",
@@ -397,12 +397,12 @@ async def run_map(
     config.source = source
     config.pattern = seed_pattern(url)
     config.live_check = False
-    # Rank the URL text here. Fetching a title for every sitemap URL is too slow,
-    # and the seeder stops collecting once max_urls is hit, before it can score.
     config.extract_head = False
     config.concurrency = 10
     config.hits_per_sec = 5
-    config.force = False
+    # A search has to read past the first sitemap page. An earlier short read is
+    # cached as if it were complete, so refresh when ranking.
+    config.force = bool(search)
     config.verbose = False
     config.max_urls = MAP_SEARCH_POOL if search else limit
     config.query = search

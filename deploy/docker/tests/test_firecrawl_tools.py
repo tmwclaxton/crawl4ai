@@ -212,11 +212,13 @@ def test_run_map_records_the_sitemap_mode_and_drops_nonsense():
             self.source = None
             self.pattern = None
             self.max_urls = None
+            self.force = None
 
         async def urls(self, domain, config):
             self.source = config.source
             self.pattern = config.pattern
             self.max_urls = config.max_urls
+            self.force = config.force
             return [
                 {"url": "https://example.com/docs/auth", "head_data": {"title": "Authentication"}},
                 {"url": "https://example.com/robots.txt", "head_data": {"title": "robots"}},
@@ -234,6 +236,7 @@ def test_run_map_records_the_sitemap_mode_and_drops_nonsense():
     ))
     assert seeder.source == "sitemap"
     assert seeder.pattern == "*"
+    assert seeder.force is True
     assert seeder.max_urls > 10
     assert result["links"] == ["https://example.com/docs/auth"]
 
