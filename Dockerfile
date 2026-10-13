@@ -204,9 +204,9 @@ RUN chown -R root:root ${APP_HOME} && chmod -R a-w ${APP_HOME}
 RUN mkdir -p /var/lib/redis /var/log/redis && chown -R appuser:appuser /var/lib/redis /var/log/redis
 
 # Sandboxed artifact store (server-owned screenshot/PDF outputs), 0700.
-RUN mkdir -p /var/lib/crawl4ai/outputs \
+RUN mkdir -p /var/lib/crawl4ai/outputs /var/lib/crawl4ai/cache \
     && chown -R appuser:appuser /var/lib/crawl4ai \
-    && chmod 700 /var/lib/crawl4ai/outputs
+    && chmod 700 /var/lib/crawl4ai/outputs /var/lib/crawl4ai/cache
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD bash -c '\

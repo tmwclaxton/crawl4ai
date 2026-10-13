@@ -128,6 +128,18 @@ class ScrapeRequest(BaseModel):
     query: Optional[str] = None
 
 
+class CacheStoreRequest(BaseModel):
+    """A page read by another service, kept so later callers reuse it."""
+    url: str = Field(..., max_length=2048)
+    markdown: str = Field(..., min_length=1, max_length=5_000_000)
+    provider: str = Field(..., min_length=1, max_length=40, pattern=r"^[a-z0-9_-]+$")
+    images: List[Dict[str, Any]] = Field(default_factory=list, max_length=200)
+
+
+class CacheForgetRequest(BaseModel):
+    url: str = Field(..., max_length=2048)
+
+
 class MapRequest(BaseModel):
     """Discover URLs on a site from its sitemap and, optionally, Common Crawl."""
     url: str

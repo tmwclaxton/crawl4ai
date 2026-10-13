@@ -6,17 +6,21 @@ handler is exposed as a tool.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Request
+import page_cache
 from artifacts import write_artifact
 from mcp_bridge import mcp_tool
 from nanogpt_client import NanoGPTError, complete
 from page_monitor import PageMonitor, nanogpt_judge, webhook_static_error
 from schemas import (
     AgentRequest,
+    CacheForgetRequest,
+    CacheStoreRequest,
     DownloadRequest,
     MapRequest,
     MonitorCreateRequest,
@@ -98,6 +102,31 @@ def _links(result: Any) -> List[str]:
             elif isinstance(item, dict) and item.get("href"):
                 found.append(item["href"])
     return found
+
+
+def _page_from_cached(url: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    links: List[str] = []
+    raw_links = result.get("links") or {}
+    groups = raw_links.values() if isinstance(raw_links, dict) else [raw_links]
+    for group in groups:
+        for item in group if isinstance(group, list) else []:
+            if isinstance(item, str):
+                links.append(item)
+            elif isinstance(item, dict) and item.get("href"):
+                links.append(item["href"])
+    return {
+        "url": url,
+        "markdown": page_cache.markdown_of(result),
+        "html": result.get("html") or "",
+        "links": links,
+    }
+
+
+def _cached_from_page(page: Dict[str, Any]) -> Dict[str, Any]:
+    result = page_cache.external_result(page["url"], page.get("markdown") or "", "crawl4ai")
+    result["html"] = page.get("html") or ""
+    result["links"] = {"internal": [{"href": link} for link in page.get("links") or []], "external": []}
+    return result
 
 
 async def _browser_page(
@@ -253,11 +282,35 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
     caps = config.get("limits") or {}
 
     async def fetch_page(url: str, **kwargs) -> Dict[str, Any]:
-        return await _browser_page(url, browser_config_factory=browser_config_factory, **kwargs)
+        if kwargs.get("screenshot") or not page_cache.cache_enabled():
+            return await _browser_page(url, browser_config_factory=browser_config_factory, **kwargs)
+        profile = "page:" + page_cache.profile_for({
+            "only_main": kwargs.get("only_main"),
+            "wait_for": kwargs.get("wait_for"),
+            "include_tags": sorted(kwargs.get("include_tags") or []),
+            "exclude_tags": sorted(kwargs.get("exclude_tags") or []),
+        })
+        plain = (
+            kwargs.get("only_main")
+            and not kwargs.get("wait_for")
+            and not kwargs.get("include_tags")
+            and not kwargs.get("exclude_tags")
+        )
+        hit = await page_cache.cache_get(url, profile, any_profile=bool(plain), external_fallback=bool(plain))
+        if hit is not None:
+            cached = _page_from_cached(url, hit["result"])
+            if cached["markdown"]:
+                cached["cache_hit"] = {"provider": hit["provider"], "age_seconds": hit["age_seconds"]}
+                return cached
+        page = await _browser_page(url, browser_config_factory=browser_config_factory, **kwargs)
+        if page.get("markdown") and not page.get("removed"):
+            await page_cache.cache_put(url, profile, _cached_from_page(page), "crawl4ai")
+        return page
 
     async def fetch_text(url: str) -> Optional[str]:
-        page = await fetch_page(
+        page = await _browser_page(
             url,
+            browser_config_factory=browser_config_factory,
             only_main=True,
             wait_for=None,
             include_tags=[],
@@ -471,6 +524,32 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
             }
         except ToolError as exc:
             _raise_tool(exc)
+
+    @app.get("/cache/stats")
+    @limiter.limit(limit)
+    async def cache_stats(request: Request, _td: Dict = Depends(token_dep)):
+        cache = page_cache.get_page_cache()
+        if cache is None:
+            return {"enabled": False}
+        return await asyncio.to_thread(cache.stats)
+
+    @app.post("/cache/store")
+    @limiter.limit(limit)
+    async def cache_store(request: Request, body: CacheStoreRequest, _td: Dict = Depends(token_dep)):
+        if not body.url.startswith(("http://", "https://")):
+            raise HTTPException(400, "url must be http or https")
+        result = page_cache.external_result(body.url, body.markdown, body.provider, body.images)
+        stored = await page_cache.cache_put(body.url, page_cache.EXTERNAL_PROFILE, result, body.provider)
+        return {"success": True, "stored": stored}
+
+    @app.post("/cache/forget")
+    @limiter.limit(limit)
+    async def cache_forget(request: Request, body: CacheForgetRequest, _td: Dict = Depends(token_dep)):
+        cache = page_cache.get_page_cache()
+        if cache is None:
+            return {"success": True, "removed": 0}
+        removed = await asyncio.to_thread(cache.forget, body.url)
+        return {"success": True, "removed": removed}
 
     @app.post("/monitor/create")
     @limiter.limit(limit)

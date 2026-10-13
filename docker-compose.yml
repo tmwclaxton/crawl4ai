@@ -43,6 +43,10 @@ x-base-config: &base-config
     # Keep the baked Playwright browser under ~/.cache/ms-playwright visible.
     - /home/appuser/.cache/url_seeder:uid=999,gid=999,mode=0700
     - /home/appuser/.gunicorn:uid=999,gid=999,mode=0700
+  # Shared page cache survives restarts. CRAWL4AI_PAGE_CACHE_TTL_HOURS and
+  # CRAWL4AI_PAGE_CACHE_MAX_MB control how long and how much it keeps.
+  volumes:
+    - crawl4ai_page_cache:/var/lib/crawl4ai/cache
   deploy:
     resources:
       limits:
@@ -77,3 +81,6 @@ services:
     
     # Inherit shared config
     <<: *base-config
+
+volumes:
+  crawl4ai_page_cache:

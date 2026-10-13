@@ -661,12 +661,43 @@ async def get_markdown(
     if not body.url.startswith(("http://", "https://")) and not body.url.startswith(("raw:", "raw://")):
         raise HTTPException(
             400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
+    import page_cache
+
+    filter_name = getattr(body.f, "value", str(body.f))
+    use_cache = page_cache.cache_enabled() and body.url.startswith(("http://", "https://"))
+    cache_profile = f"md:{filter_name}:{body.q or ''}:{body.provider or ''}"
+    if use_cache and str(body.c).lower() not in {"bypass", "disabled", "write_only"}:
+        hit = await page_cache.cache_get(
+            body.url,
+            cache_profile,
+            any_profile=filter_name == "raw",
+            external_fallback=filter_name in {"raw", "fit"},
+        )
+        if hit is not None:
+            cached_markdown = page_cache.markdown_of(hit["result"])
+            if cached_markdown:
+                return JSONResponse({
+                    "url": body.url,
+                    "filter": body.f,
+                    "query": body.q,
+                    "cache": body.c,
+                    "markdown": cached_markdown,
+                    "success": True,
+                    "cache_hit": {"provider": hit["provider"], "age_seconds": hit["age_seconds"]},
+                })
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
     markdown = await handle_markdown_request(
         body.url, body.f, body.q, body.c, config, body.provider,
         body.temperature
     )
+    if use_cache and markdown and str(body.c).lower() not in {"disabled", "read_only"}:
+        await page_cache.cache_put(
+            body.url,
+            cache_profile,
+            page_cache.external_result(body.url, markdown, "crawl4ai"),
+            "crawl4ai",
+        )
     return JSONResponse({
         "url": body.url,
         "filter": body.f,
@@ -1015,14 +1046,56 @@ async def crawl(
             'timeout': crawl_request.hooks.timeout
         }
 
+    import page_cache
+
+    crawler_config_body = crawl_request.crawler_config
+    cache_url = None
+    cache_profile = None
+    cache_mode = "disabled"
+    params = page_cache.crawl_params(crawler_config_body)
+    if (
+        page_cache.cache_enabled()
+        and len(crawl_request.urls) == 1
+        and not crawl_request.hooks
+        and not crawl_request.crawler_configs
+        and page_cache.cacheable_crawl(params)
+    ):
+        cache_url = crawl_request.urls[0]
+        cache_profile = page_cache.profile_for(params)
+        cache_mode = page_cache.cache_mode_of(params)
+        if page_cache.reads_cache(cache_mode):
+            hit = await page_cache.cache_get(cache_url, cache_profile)
+            if hit is not None:
+                cached = hit["result"]
+                cached.setdefault("metadata", {})
+                if isinstance(cached["metadata"], dict):
+                    cached["metadata"]["provider"] = hit["provider"]
+                return JSONResponse({
+                    "success": True,
+                    "results": [cached],
+                    "server_processing_time_s": 0,
+                    "server_memory_delta_mb": None,
+                    "server_peak_memory_mb": None,
+                    "cache": {"hit": True, "provider": hit["provider"], "age_seconds": hit["age_seconds"]},
+                })
+        if isinstance(crawler_config_body, dict) and isinstance(crawler_config_body.get("params"), dict):
+            crawler_config_body = {
+                **crawler_config_body,
+                "params": {**crawler_config_body["params"], "cache_mode": "bypass"},
+            }
+
     results = await handle_crawl_request(
         urls=crawl_request.urls,
         browser_config=crawl_request.browser_config,
-        crawler_config=crawl_request.crawler_config,
+        crawler_config=crawler_config_body,
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
     )
+    if cache_url is not None and page_cache.writes_cache(cache_mode):
+        first = (results.get("results") or [None])[0] if isinstance(results, dict) else None
+        if isinstance(first, dict) and first.get("success"):
+            await page_cache.cache_put(cache_url, cache_profile, first, page_cache.provider_of(first))
     if crawl_request.hooks and crawl_request.hooks.code:
         hooks_resp = results.setdefault("hooks", {"status": "ignored", "attached": []})
         if not crawl_request.hooks.hooks:
