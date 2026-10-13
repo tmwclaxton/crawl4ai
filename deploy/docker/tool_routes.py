@@ -42,6 +42,27 @@ def _raise_tool(exc: ToolError) -> None:
     raise HTTPException(exc.status, exc.detail)
 
 
+def _apify_token() -> str:
+    return os.environ.get("APIFY_TOKEN") or os.environ.get("APIFY_API_TOKEN") or ""
+
+
+async def _search_fetch(
+    name: str,
+    url: str,
+    headers: Dict[str, str],
+    payload: Optional[Dict[str, Any]] = None,
+):
+    import httpx
+
+    timeout = 120 if payload is not None else 12
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        if payload is None:
+            response = await client.get(url, headers=headers)
+        else:
+            response = await client.post(url, headers=headers, json=payload)
+        return response.status_code, response.text
+
+
 async def _complete(messages: List[Dict[str, str]]) -> str:
     try:
         return await complete(messages)
@@ -293,24 +314,15 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
     @limiter.limit(limit)
     @mcp_tool("search")
     async def search(request: Request, body: SearchRequest, _td: Dict = Depends(token_dep)):
-        """Search the web across several engines and skip any engine that blocks the request."""
-        import httpx
-
-        brave_key = os.environ.get("BRAVE_API_KEY") or os.environ.get("BRAVE_SEARCH_API_KEY") or ""
-
-        async def fetch(name: str, url: str, headers: Dict[str, str]):
-            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-                response = await client.get(url, headers=headers)
-                return response.status_code, response.text
-
+        """Search free engines first, then Google through Apify if the result list is still short."""
         try:
             result = await run_search(
                 body.query,
                 limit=body.limit,
                 sources=body.sources,
                 categories=body.categories,
-                brave_key=brave_key,
-                fetch=fetch,
+                apify_token=_apify_token(),
+                fetch=_search_fetch,
             )
             if body.scrape:
                 hits = result["data"].get("web") or result["data"].get("news") or []
@@ -366,22 +378,13 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
             )
 
         async def discover(prompt: str) -> List[str]:
-            import httpx
-
-            brave_key = os.environ.get("BRAVE_API_KEY") or os.environ.get("BRAVE_SEARCH_API_KEY") or ""
-
-            async def fetch(name: str, target: str, headers: Dict[str, str]):
-                async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-                    response = await client.get(target, headers=headers)
-                    return response.status_code, response.text
-
             found = await run_search(
                 prompt,
                 limit=5,
                 sources="web",
                 categories=None,
-                brave_key=brave_key,
-                fetch=fetch,
+                apify_token=_apify_token(),
+                fetch=_search_fetch,
             )
             return [hit["url"] for hit in found["data"].get("web") or []]
 

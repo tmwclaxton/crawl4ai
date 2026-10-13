@@ -447,6 +447,11 @@ def search_request_url(engine: str, query: str, source: str) -> tuple[str, Dict[
         base = "https://searx.tiekoetter.com/search"
         category = "&categories=news" if news else ""
         return f"{base}?q={encoded}&format=json{category}", headers
+    if engine == "apify":
+        return (
+            "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?timeout=120",
+            {},
+        )
     raise ToolError(400, f"Unknown search engine {engine}")
 
 
@@ -461,6 +466,8 @@ def parse_search_body(engine: str, body: str) -> List[Dict[str, str]]:
         return _parse_mojeek(body)
     if engine == "searxng":
         return _parse_searx(body)
+    if engine == "apify":
+        return _parse_apify(body)
     return []
 
 
@@ -550,10 +557,55 @@ def _parse_searx(body: str) -> List[Dict[str, str]]:
     return hits
 
 
-def engine_names(brave_key: str) -> List[str]:
+def apify_input(query: str, source: str) -> Dict[str, Any]:
+    """One Google results page. Paid add-ons stay off."""
+    term = query
+    if source == "news":
+        term = "https://www.google.com/search?tbm=nws&q=" + quote_plus(query)
+    return {
+        "queries": term,
+        "maxPagesPerQuery": 1,
+        "saveHtml": False,
+        "saveHtmlToKeyValueStore": False,
+        "focusOnPaidAds": False,
+        "maximumLeadsEnrichmentRecords": 0,
+        "aiOverview": {"scrapeFullAiOverview": False},
+        "aiModeSearch": {"enableAiMode": False},
+        "perplexitySearch": {"enablePerplexity": False},
+        "chatGptSearch": {"enableChatGpt": False},
+        "copilotSearch": {"enableCopilot": False},
+        "geminiSearch": {"enableGemini": False},
+        "websiteContentScraper": {"enable": False},
+    }
+
+
+def _parse_apify(body: str) -> List[Dict[str, str]]:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    rows = payload if isinstance(payload, list) else payload.get("items") or []
+    hits = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for item in row.get("organicResults") or []:
+            url = item.get("url") or ""
+            if not url:
+                continue
+            hits.append({
+                "url": url,
+                "title": item.get("title") or "",
+                "description": item.get("description") or "",
+                "engine": "apify",
+            })
+    return hits
+
+
+def engine_names(apify_token: str = "") -> List[str]:
     names = ["duckduckgo", "bing", "mojeek", "searxng"]
-    if brave_key:
-        names.insert(0, "brave")
+    if apify_token:
+        names.append("apify")
     return names
 
 
@@ -563,8 +615,8 @@ async def run_search(
     limit: int,
     sources: str,
     categories: Optional[str],
-    brave_key: str = "",
-    fetch: Callable[[str, str, Dict[str, str]], Awaitable[tuple[int, str]]],
+    apify_token: str = "",
+    fetch: Callable[..., Awaitable[tuple[int, str]]],
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not query.strip():
@@ -577,25 +629,30 @@ async def run_search(
     groups = []
     used = []
     skipped = []
-    for name in engine_names(brave_key):
+    for name in engine_names(apify_token):
         if engine_cooled(name, clock):
             skipped.append({"engine": name, "reason": "cooldown"})
             continue
         url, headers = search_request_url(name, narrowed, source)
-        if name == "brave" and brave_key:
-            headers = {**headers, "X-Subscription-Token": brave_key}
-        status, body = await fetch(name, url, headers)
+        payload = None
+        if name == "apify":
+            headers = {"Authorization": f"Bearer {apify_token}"}
+            payload = apify_input(narrowed, source)
+            status, body = await fetch(name, url, headers, payload)
+        else:
+            status, body = await fetch(name, url, headers)
         if is_blocked_search(status, body):
             cool_engine(name, clock)
             skipped.append({"engine": name, "reason": "blocked"})
             continue
+        if status >= 400:
+            skipped.append({"engine": name, "reason": "error"})
+            continue
         hits = parse_search_body(name, body)
         used.append(name)
         groups.append(hits)
-        if sum(len(group) for group in groups) >= limit and merge_hits(groups, limit):
-            # Keep scanning only until the merged list is full.
-            if len(merge_hits(groups, limit)) >= limit:
-                break
+        if len(merge_hits(groups, limit)) >= limit:
+            break
     hits = merge_hits(groups, limit)
     bucket = "news" if source == "news" else "web"
     return {

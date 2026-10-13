@@ -32,6 +32,8 @@ from site_tools import (
     run_agent,
     run_map,
     run_scrape,
+    apify_input,
+    engine_names,
     run_search,
     search_request_url,
     seed_source,
@@ -304,7 +306,7 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
         limit=5,
         sources="web",
         categories=None,
-        brave_key="",
+        apify_token="",
         fetch=fetch,
         now=1000,
     ))
@@ -325,7 +327,7 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
         limit=2,
         sources="web",
         categories=None,
-        brave_key="",
+        apify_token="",
         fetch=plenty,
         now=5000,
     ))
@@ -335,6 +337,68 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
     news_url, _headers = search_request_url("bing", "grant pricing", "news")
     assert "/news/search" in news_url
     assert "site:github.com" in narrow_query("timeout error", "developer")
+    assert engine_names("") == ["duckduckgo", "bing", "mojeek", "searxng"]
+    assert engine_names("token")[-1] == "apify"
+    assert "brave" not in engine_names("token")
+
+
+def test_apify_runs_only_after_free_engines_and_parses_organic_results():
+    body = _read("apify.json")
+    parsed = parse_search_body("apify", body)
+    assert parsed[0]["url"] == "https://docs.python.org/3/library/itertools.html"
+    assert parsed[0]["engine"] == "apify"
+
+    news = apify_input("grant deadlines", "news")
+    assert news["queries"].startswith("https://www.google.com/search?tbm=nws&q=")
+    assert news["maxPagesPerQuery"] == 1
+    assert news["saveHtml"] is False
+    assert news["websiteContentScraper"]["enable"] is False
+    assert news["aiModeSearch"]["enableAiMode"] is False
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append((name, payload))
+        if name == "apify":
+            assert headers["Authorization"] == "Bearer secret"
+            assert "token=" not in url
+            assert payload["maxPagesPerQuery"] == 1
+            return 201, body
+        if name == "duckduckgo":
+            return 200, _read("ddg.html")
+        return 403, ""
+
+    result = asyncio.run(run_search(
+        "python itertools",
+        limit=5,
+        sources="web",
+        categories=None,
+        apify_token="secret",
+        fetch=fetch,
+        now=9000,
+    ))
+    assert calls[0][0] == "duckduckgo"
+    assert calls[-1][0] == "apify"
+    assert "apify" in result["engines_used"]
+    urls = [hit["url"] for hit in result["data"]["web"]]
+    assert "https://docs.python.org/3/library/itertools.html" in urls
+
+    filled = []
+
+    async def plenty(name, url, headers, payload=None):
+        filled.append(name)
+        return 200, _read("ddg.html") if name == "duckduckgo" else _read("bing.xml")
+
+    asyncio.run(run_search(
+        "python itertools",
+        limit=2,
+        sources="web",
+        categories=None,
+        apify_token="secret",
+        fetch=plenty,
+        now=20000,
+    ))
+    assert "apify" not in filled
 
 
 def test_agent_caps_pages_and_checks_the_schema():
