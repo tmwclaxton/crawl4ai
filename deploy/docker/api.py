@@ -816,6 +816,27 @@ async def handle_crawl_request(
                     "error_message": str(e)
                 })
 
+        from proxy_fallback import fill_failed_with_proxy
+
+        async def _proxy_retry(url: str):
+            retry_config = effective_config[0] if isinstance(effective_config, list) else effective_config
+            raw = await crawler.arun(url, config=retry_config, dispatcher=dispatcher)
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if raw is None:
+                return None
+            if hasattr(raw, "model_dump"):
+                dumped = raw.model_dump()
+            elif isinstance(raw, dict):
+                dumped = raw
+            else:
+                return None
+            if dumped.get("pdf") is not None and isinstance(dumped.get("pdf"), bytes):
+                dumped["pdf"] = b64encode(dumped["pdf"]).decode("utf-8")
+            return dumped
+
+        processed_results = await fill_failed_with_proxy(processed_results, _proxy_retry)
+
         from firecrawl_fallback import fill_failed_results
         processed_results = await fill_failed_results(processed_results)
 

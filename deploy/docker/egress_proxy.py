@@ -27,11 +27,16 @@ import base64
 import ipaddress
 import logging
 import os
+from contextvars import ContextVar
+from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from egress_broker import EgressBlocked, resolve_and_pin
 
 logger = logging.getLogger("crawl4ai.egress")
+
+# One retry at a time can chain through DataImpulse without a process-wide HTTP_PROXY.
+_request_upstream: ContextVar[Optional[str]] = ContextVar("request_upstream", default=None)
 
 _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
@@ -39,32 +44,51 @@ _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
 
 
+def set_request_upstream(url: Optional[str]):
+    """Route this task's CONNECT through `url` until reset_request_upstream."""
+    return _request_upstream.set(url)
+
+
+def reset_request_upstream(token) -> None:
+    _request_upstream.reset(token)
+
+
+def _parse_proxy_url(raw: str, name: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    sp = urlsplit(raw if "://" in raw else "http://" + raw)
+    if not sp.hostname:
+        logger.warning("ignoring %s: unparseable proxy URL", name)
+        return None
+    if sp.scheme != "http":
+        # We only speak plaintext HTTP to the upstream (no TLS/socks dial).
+        logger.warning("ignoring %s: unsupported proxy scheme %r", name, sp.scheme)
+        return None
+    auth = None
+    if sp.username:
+        cred = f"{unquote(sp.username)}:{unquote(sp.password or '')}".encode("utf-8")
+        auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
+    return sp.hostname, sp.port or 80, auth
+
+
 def upstream_proxy(scheme: str = "https"):
     """(host, port, auth_header_bytes|None) of the upstream proxy, or None.
 
-    Read per-call (not at import) so operators and tests see env changes.
-    The target scheme picks HTTP(S)_PROXY per convention; the first
-    candidate that parses wins, so junk values fall through to a fallback.
+    A request-scoped DataImpulse retry wins over env. Env is still read
+    per-call so operators and tests see changes.
     """
+    scoped = _request_upstream.get()
+    if scoped:
+        parsed = _parse_proxy_url(scoped, "request-upstream")
+        if parsed is not None:
+            return parsed
     order = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy") if scheme == "http" \
         else ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
     for name in ("CRAWL4AI_UPSTREAM_PROXY", *order):
-        raw = (os.environ.get(name) or "").strip()
-        if not raw:
-            continue
-        sp = urlsplit(raw if "://" in raw else "http://" + raw)
-        if not sp.hostname:
-            logger.warning("ignoring %s: unparseable proxy URL", name)
-            continue
-        if sp.scheme != "http":
-            # We only speak plaintext HTTP to the upstream (no TLS/socks dial).
-            logger.warning("ignoring %s: unsupported proxy scheme %r", name, sp.scheme)
-            continue
-        auth = None
-        if sp.username:
-            cred = f"{unquote(sp.username)}:{unquote(sp.password or '')}".encode("utf-8")
-            auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
-        return sp.hostname, sp.port or 80, auth
+        parsed = _parse_proxy_url(os.environ.get(name) or "", name)
+        if parsed is not None:
+            return parsed
     return None
 
 
