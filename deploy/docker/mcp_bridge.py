@@ -158,12 +158,16 @@ def attach_mcp(
             raise HTTPException(404, "tool not found")
         
         proxy, _ = tools[name]
+        import time as _time, usage_log
+        started = _time.time()
         try:
             res = await proxy(**(arguments or {}))
         except HTTPException as exc:
+            await usage_log.record_mcp_tool(name, False, started, str(exc.detail)[:200])
             # map server‑side errors into MCP "text/error" payloads
             err = {"error": exc.status_code, "detail": exc.detail}
             return [t.TextContent(type = "text", text=json.dumps(err, ensure_ascii=False))]
+        await usage_log.record_mcp_tool(name, True, started)
         return [t.TextContent(type = "text", text=json.dumps(res, default=str, ensure_ascii=False))]
 
     @mcp.list_resources()

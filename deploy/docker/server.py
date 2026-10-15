@@ -568,6 +568,12 @@ app.include_router(init_job_router(redis, config, token_dep))
 from monitor_routes import router as monitor_router
 app.include_router(monitor_router)
 
+# Per-call usage log read by GrantGunner (GET /monitor/usage).
+import usage_log
+usage_log.init(redis)
+app.include_router(usage_log.router)
+app.add_middleware(usage_log.UsageLogMiddleware)
+
 logger = logging.getLogger(__name__)
 
 
