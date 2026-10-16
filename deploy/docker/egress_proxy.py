@@ -16,7 +16,7 @@ Bound to 127.0.0.1 on an ephemeral port; started at server boot.
 
 If HTTP_PROXY/HTTPS_PROXY (or CRAWL4AI_UPSTREAM_PROXY) is set, we still
 resolve-and-pin locally but dial via the upstream proxy, asking it to CONNECT
-to the PINNED IP — never the hostname — so the rebinding guarantee holds.
+to the PINNED IP, never the hostname, so the rebinding guarantee holds.
 NO_PROXY bypasses it; with no proxy env set, behavior is unchanged.
 """
 
@@ -27,7 +27,7 @@ import base64
 import ipaddress
 import logging
 import os
-from contextvars import ContextVar
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import unquote, urlsplit
 
@@ -35,8 +35,12 @@ from egress_broker import EgressBlocked, resolve_and_pin
 
 logger = logging.getLogger("crawl4ai.egress")
 
-# One retry at a time can chain through DataImpulse without a process-wide HTTP_PROXY.
-_request_upstream: ContextVar[Optional[str]] = ContextVar("request_upstream", default=None)
+# Playwright CONNECTs are handled by PinningProxy._handle, a start_server task.
+# A ContextVar set on the crawl task is invisible there, so the retry must be a
+# process-wide upstream. One retry at a time; concurrent first-crawls in that
+# window also chain through DataImpulse.
+_active_upstream: Optional[str] = None
+_upstream_lock: Optional[asyncio.Lock] = None
 
 _CONNECT_OK = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _BLOCKED = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 11\r\n\r\nURL blocked"
@@ -44,13 +48,35 @@ _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
 
 
+def _get_upstream_lock() -> asyncio.Lock:
+    global _upstream_lock
+    if _upstream_lock is None:
+        _upstream_lock = asyncio.Lock()
+    return _upstream_lock
+
+
 def set_request_upstream(url: Optional[str]):
-    """Route this task's CONNECT through `url` until reset_request_upstream."""
-    return _request_upstream.set(url)
+    """Route CONNECT through `url` until reset_request_upstream. Returns the previous value."""
+    global _active_upstream
+    previous = _active_upstream
+    _active_upstream = url
+    return previous
 
 
 def reset_request_upstream(token) -> None:
-    _request_upstream.reset(token)
+    global _active_upstream
+    _active_upstream = token
+
+
+@asynccontextmanager
+async def use_request_upstream(url: Optional[str]):
+    """Serialize a DataImpulse hop so the pinning proxy handler can see it."""
+    async with _get_upstream_lock():
+        token = set_request_upstream(url)
+        try:
+            yield
+        finally:
+            reset_request_upstream(token)
 
 
 def _parse_proxy_url(raw: str, name: str):
@@ -78,7 +104,7 @@ def upstream_proxy(scheme: str = "https"):
     A request-scoped DataImpulse retry wins over env. Env is still read
     per-call so operators and tests see changes.
     """
-    scoped = _request_upstream.get()
+    scoped = _active_upstream
     if scoped:
         parsed = _parse_proxy_url(scoped, "request-upstream")
         if parsed is not None:

@@ -76,6 +76,43 @@ def test_request_scoped_upstream_beats_env(monkeypatch):
     assert egress_proxy.upstream_proxy() == ("env-proxy", 3128, None)
 
 
+def test_pinning_proxy_handler_sees_request_upstream(monkeypatch):
+    monkeypatch.delenv("CRAWL4AI_UPSTREAM_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+
+    async def prove():
+        seen = {"handler": None}
+
+        async def handler(reader, writer):
+            seen["handler"] = egress_proxy.upstream_proxy()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        host, port = server.sockets[0].getsockname()[:2]
+        async with egress_proxy.use_request_upstream(
+            "http://dc-user:dc-pass@gw.dataimpulse.com:823"
+        ):
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.write(b"GET / HTTP/1.1\r\n\r\n")
+            await writer.drain()
+            await reader.read(64)
+            writer.close()
+        server.close()
+        await server.wait_closed()
+        return seen["handler"]
+
+    handler_upstream = asyncio.run(prove())
+    assert handler_upstream is not None
+    assert handler_upstream[0] == "gw.dataimpulse.com"
+    assert handler_upstream[1] == 823
+    assert egress_proxy.upstream_proxy() is None
+
+
 def test_recovers_on_datacenter_and_leaves_a_good_page(monkeypatch):
     _clear_dataimpulse(monkeypatch)
     _set_tiers(monkeypatch)

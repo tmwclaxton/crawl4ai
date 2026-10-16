@@ -1,8 +1,9 @@
 """Retry a failed local crawl through DataImpulse, cheapest tier first.
 
 A process-wide HTTP_PROXY would bill every page. Each retry instead sets a
-request-scoped upstream on the pinning proxy (egress_proxy.set_request_upstream).
-Image SERPs are skipped. Firecrawl stays last and stays off unless enabled.
+process-wide upstream on the pinning proxy for the duration of one hop
+(egress_proxy.use_request_upstream). Image SERPs are skipped. Firecrawl stays
+last and stays off unless enabled.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ async def fill_failed_with_proxy(
     if not proxy_fallback_enabled():
         return results
 
-    from egress_proxy import reset_request_upstream, set_request_upstream
+    from egress_proxy import use_request_upstream
 
     tiers = configured_tiers()
     for result in results:
@@ -97,17 +98,17 @@ async def fill_failed_with_proxy(
         if skip_paid_proxy(url):
             continue
         for name, proxy_url in tiers:
-            token = set_request_upstream(proxy_url)
             recovered = None
             try:
-                recovered = await crawl(url)
+                logger.warning("DataImpulse %s retrying %s", name, url)
+                async with use_request_upstream(proxy_url):
+                    recovered = await crawl(url)
             except Exception:
-                logger.info("DataImpulse %s retry failed for %s", name, url, exc_info=True)
-            finally:
-                reset_request_upstream(token)
+                logger.warning("DataImpulse %s retry failed for %s", name, url, exc_info=True)
             if not isinstance(recovered, dict) or result_needs_fallback(recovered):
+                logger.warning("DataImpulse %s still blocked %s", name, url)
                 continue
             apply_proxy_result(result, recovered, name)
-            logger.info("DataImpulse %s recovered %s", name, url)
+            logger.warning("DataImpulse %s recovered %s", name, url)
             break
     return results
