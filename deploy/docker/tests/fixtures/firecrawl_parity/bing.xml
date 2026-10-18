@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <rss><channel>
   <item>
-    <title>Bing docs</title>
+    <title>Grant pricing itertools Bing docs</title>
     <link>https://example.com/docs</link>
     <description>Same page as DuckDuckGo</description>
   </item>
   <item>
-    <title>Bing only</title>
+    <title>Grant pricing itertools Bing only</title>
     <link>https://bing-only.example/item</link>
     <description>Unique bing hit</description>
   </item>

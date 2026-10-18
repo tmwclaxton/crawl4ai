@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import re
 import time
 import zipfile
@@ -34,7 +35,13 @@ _BLOCK_PHRASES = (
     "enable javascript and cookies",
 )
 _NONSENSE_SUFFIXES = ("robots.txt", "sitemap.xml", "ads.txt", "favicon.ico")
+_SEARCH_STOP = {
+    "the", "and", "for", "with", "from", "this", "that", "site", "www",
+    "http", "https", "com", "org", "net", "search", "page", "home", "news",
+    "web", "linkedin", "profile", "google", "bing",
+}
 _cooled_until: Dict[str, float] = {}
+_search_log = logging.getLogger("crawl4ai.search")
 
 
 class ToolError(Exception):
@@ -102,6 +109,38 @@ def is_blocked_search(status: int, body: str) -> bool:
         return True
     lowered = (body or "").lower()
     return any(phrase in lowered for phrase in _BLOCK_PHRASES)
+
+
+def query_terms(query: str) -> List[str]:
+    return [token for token in re.findall(r"[a-z0-9]{3,}", query.lower()) if token not in _SEARCH_STOP]
+
+
+def hit_matches_query(hit: Dict[str, str], terms: Sequence[str]) -> bool:
+    hay = " ".join(
+        [hit.get("url") or "", hit.get("title") or "", hit.get("description") or ""]
+    ).lower()
+    distinctive = [token for token in terms if len(token) >= 6]
+    if distinctive:
+        return any(token in hay for token in distinctive)
+    needed = 2 if len(terms) >= 3 else 1
+    return sum(1 for token in terms if token in hay) >= needed
+
+
+def relevant_hits(hits: Sequence[Dict[str, str]], query: str) -> List[Dict[str, str]]:
+    terms = query_terms(query)
+    if not terms:
+        return list(hits)
+    return [hit for hit in hits if hit_matches_query(hit, terms)]
+
+
+def search_hits_are_junk(hits: Sequence[Dict[str, str]], query: str) -> bool:
+    """True when the engine answered but the items ignore the query."""
+    if not hits:
+        return True
+    kept = relevant_hits(hits, query)
+    if not kept:
+        return True
+    return len(kept) / len(hits) < 0.4
 
 
 def merge_hits(groups: Iterable[Sequence[Dict[str, str]]], limit: int) -> List[Dict[str, str]]:
@@ -449,7 +488,7 @@ def search_request_url(engine: str, query: str, source: str) -> tuple[str, Dict[
         return f"{base}?q={encoded}&format=json{category}", headers
     if engine == "apify":
         return (
-            "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?timeout=120",
+            "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?timeout=120&memory=512",
             {},
         )
     raise ToolError(400, f"Unknown search engine {engine}")
@@ -649,8 +688,15 @@ async def run_search(
             skipped.append({"engine": name, "reason": "error"})
             continue
         hits = parse_search_body(name, body)
+        if name != "apify" and search_hits_are_junk(hits, narrowed):
+            _search_log.warning(
+                "search engine %s returned irrelevant hits for %r", name, narrowed
+            )
+            skipped.append({"engine": name, "reason": "irrelevant"})
+            continue
+        kept = hits if name == "apify" else relevant_hits(hits, narrowed)
         used.append(name)
-        groups.append(hits)
+        groups.append(kept)
         if len(merge_hits(groups, limit)) >= limit:
             break
     hits = merge_hits(groups, limit)

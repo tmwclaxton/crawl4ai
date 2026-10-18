@@ -25,6 +25,8 @@ from site_tools import (
     normalize_snapshot,
     parse_search_body,
     parse_sitemap_xml,
+    relevant_hits,
+    search_hits_are_junk,
     path_allowed,
     rank_mapped,
     reset_search_state,
@@ -340,6 +342,46 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
     assert engine_names("") == ["duckduckgo", "bing", "mojeek", "searxng"]
     assert engine_names("token")[-1] == "apify"
     assert "brave" not in engine_names("token")
+    assert "memory=512" in search_request_url("apify", "grants", "web")[0]
+
+
+def test_junk_bing_hits_fall_through_to_apify():
+    junk = _read("bing_junk.xml")
+    assert search_hits_are_junk(parse_search_body("bing", junk), "Infinitopes director linkedin") is True
+    assert relevant_hits(parse_search_body("bing", junk), "Infinitopes director linkedin") == []
+    assert search_hits_are_junk(
+        [{"url": "https://linkedin.com/in/pinch", "title": "Sarah Pinch - Gingerbread", "description": ""}],
+        "Sarah Pinch Gingerbread linkedin",
+    ) is False
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        if name == "apify":
+            assert "memory=512" in url
+            return 201, _read("apify.json")
+        if name == "bing":
+            return 200, junk
+        if name == "duckduckgo":
+            return 200, _read("captcha.html")
+        return 403, ""
+
+    result = asyncio.run(run_search(
+        "Infinitopes director linkedin",
+        limit=5,
+        sources="web",
+        categories=None,
+        apify_token="secret",
+        fetch=fetch,
+        now=30000,
+    ))
+    assert "bing" not in result["engines_used"]
+    assert {"engine": "bing", "reason": "irrelevant"} in result["engines_skipped"]
+    assert "apify" in result["engines_used"]
+    assert result["data"]["web"][0]["url"] == "https://docs.python.org/3/library/itertools.html"
+    assert result["data"]["web"][0]["engine"] == "apify"
+    assert calls[-1] == "apify"
 
 
 def test_apify_runs_only_after_free_engines_and_parses_organic_results():
