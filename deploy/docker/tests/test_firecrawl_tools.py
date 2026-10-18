@@ -23,10 +23,10 @@ from site_tools import (
     merge_hits,
     narrow_query,
     normalize_snapshot,
+    parse_relevance_answer,
     parse_search_body,
+    search_hits_are_relevant,
     parse_sitemap_xml,
-    relevant_hits,
-    search_hits_are_junk,
     path_allowed,
     rank_mapped,
     reset_search_state,
@@ -367,14 +367,21 @@ def test_engine_fetch_error_is_skipped():
     assert result["data"]["web"]
 
 
+def test_relevance_answer_is_yes_or_no():
+    assert parse_relevance_answer("YES") is True
+    assert parse_relevance_answer("yes, they match") is True
+    assert parse_relevance_answer("NO") is False
+    assert parse_relevance_answer("no - shopping results") is False
+    assert parse_relevance_answer("") is None
+    assert parse_relevance_answer("maybe") is None
+    assert asyncio.run(search_hits_are_relevant("q", [])) is False
+
+
 def test_junk_bing_hits_fall_through_to_apify():
     junk = _read("bing_junk.xml")
-    assert search_hits_are_junk(parse_search_body("bing", junk), "Infinitopes director linkedin") is True
-    assert relevant_hits(parse_search_body("bing", junk), "Infinitopes director linkedin") == []
-    assert search_hits_are_junk(
-        [{"url": "https://linkedin.com/in/pinch", "title": "Sarah Pinch - Gingerbread", "description": ""}],
-        "Sarah Pinch Gingerbread linkedin",
-    ) is False
+
+    async def no_match(messages):
+        return "NO"
 
     calls = []
 
@@ -397,6 +404,7 @@ def test_junk_bing_hits_fall_through_to_apify():
         apify_token="secret",
         fetch=fetch,
         now=30000,
+        judge=no_match,
     ))
     assert "bing" not in result["engines_used"]
     assert {"engine": "bing", "reason": "irrelevant"} in result["engines_skipped"]
@@ -404,6 +412,63 @@ def test_junk_bing_hits_fall_through_to_apify():
     assert result["data"]["web"][0]["url"] == "https://docs.python.org/3/library/itertools.html"
     assert result["data"]["web"][0]["engine"] == "apify"
     assert calls[-1] == "apify"
+
+
+def test_synonym_hits_kept_when_judge_says_yes():
+    async def yes(messages):
+        content = messages[-1]["content"]
+        assert "Sarah Pinch Gingerbread" in content
+        assert "linkedin.com/in/pinch" in content
+        return "YES"
+
+    async def fetch(name, url, headers, payload=None):
+        if name == "duckduckgo":
+            return 200, (
+                '<html><body>'
+                '<a class="result__a" href="https://linkedin.com/in/pinch">'
+                "Sarah Pinch - Fundraising Manager at Gingerbread</a>"
+                '<a class="result__snippet">UK single parent charity</a>'
+                "</body></html>"
+            )
+        raise AssertionError(f"should not call {name}")
+
+    result = asyncio.run(run_search(
+        "Sarah Pinch Gingerbread linkedin",
+        limit=3,
+        sources="web",
+        categories=None,
+        apify_token="secret",
+        fetch=fetch,
+        now=31000,
+        judge=yes,
+    ))
+    assert result["engines_used"] == ["duckduckgo"]
+    assert result["data"]["web"][0]["url"] == "https://linkedin.com/in/pinch"
+
+
+def test_judge_failure_keeps_engine_hits():
+    async def boom_judge(messages):
+        raise RuntimeError("nanogpt down")
+
+    async def fetch(name, url, headers, payload=None):
+        if name == "duckduckgo":
+            raise TimeoutError("connect")
+        if name == "bing":
+            return 200, _read("bing.xml")
+        return 403, ""
+
+    result = asyncio.run(run_search(
+        "grant pricing",
+        limit=2,
+        sources="web",
+        categories=None,
+        apify_token="",
+        fetch=fetch,
+        now=32000,
+        judge=boom_judge,
+    ))
+    assert "bing" in result["engines_used"]
+    assert result["data"]["web"]
 
 
 def test_apify_runs_only_after_free_engines_and_parses_organic_results():

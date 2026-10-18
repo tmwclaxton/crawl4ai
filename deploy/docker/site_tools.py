@@ -35,11 +35,6 @@ _BLOCK_PHRASES = (
     "enable javascript and cookies",
 )
 _NONSENSE_SUFFIXES = ("robots.txt", "sitemap.xml", "ads.txt", "favicon.ico")
-_SEARCH_STOP = {
-    "the", "and", "for", "with", "from", "this", "that", "site", "www",
-    "http", "https", "com", "org", "net", "search", "page", "home", "news",
-    "web", "linkedin", "profile", "google", "bing",
-}
 _cooled_until: Dict[str, float] = {}
 _search_log = logging.getLogger("crawl4ai.search")
 
@@ -111,36 +106,73 @@ def is_blocked_search(status: int, body: str) -> bool:
     return any(phrase in lowered for phrase in _BLOCK_PHRASES)
 
 
-def query_terms(query: str) -> List[str]:
-    return [token for token in re.findall(r"[a-z0-9]{3,}", query.lower()) if token not in _SEARCH_STOP]
+def format_hits_for_judge(hits: Sequence[Dict[str, str]], *, max_hits: int = 8) -> str:
+    """Compact title, URL, and snippet list for a cheap relevance call."""
+    lines: List[str] = []
+    for index, hit in enumerate(hits[:max_hits], start=1):
+        title = (hit.get("title") or "").strip()
+        url = (hit.get("url") or "").strip()
+        description = (hit.get("description") or "").strip()
+        if len(description) > 160:
+            description = description[:157] + "..."
+        lines.append(f"{index}. {title}\n   {url}\n   {description}")
+    return "\n".join(lines)
 
 
-def hit_matches_query(hit: Dict[str, str], terms: Sequence[str]) -> bool:
-    hay = " ".join(
-        [hit.get("url") or "", hit.get("title") or "", hit.get("description") or ""]
-    ).lower()
-    distinctive = [token for token in terms if len(token) >= 6]
-    if distinctive:
-        return any(token in hay for token in distinctive)
-    needed = 2 if len(terms) >= 3 else 1
-    return sum(1 for token in terms if token in hay) >= needed
+def search_judge_messages(query: str, hits: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    listing = format_hits_for_judge(hits)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You judge whether a search result list matches the user's query. "
+                "Reply with only YES or NO. "
+                "YES if most results are about the same people, organisation, role, or subject. "
+                "Synonyms, job titles, company names, and LinkedIn profiles count as relevant. "
+                "NO if the list is unrelated, generic shopping, captcha, empty, or random news "
+                "that only shares a common word."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Query:\n{query}\n\nResults:\n{listing}",
+        },
+    ]
 
 
-def relevant_hits(hits: Sequence[Dict[str, str]], query: str) -> List[Dict[str, str]]:
-    terms = query_terms(query)
-    if not terms:
-        return list(hits)
-    return [hit for hit in hits if hit_matches_query(hit, terms)]
+def parse_relevance_answer(raw: str) -> Optional[bool]:
+    text = (raw or "").strip().upper()
+    if not text:
+        return None
+    first = re.split(r"[\s.,:;!?]+", text, maxsplit=1)[0]
+    if first == "YES":
+        return True
+    if first == "NO":
+        return False
+    return None
 
 
-def search_hits_are_junk(hits: Sequence[Dict[str, str]], query: str) -> bool:
-    """True when the engine answered but the items ignore the query."""
+async def search_hits_are_relevant(
+    query: str,
+    hits: Sequence[Dict[str, str]],
+    *,
+    judge: Optional[Callable[[List[Dict[str, str]]], Awaitable[str]]] = None,
+) -> bool:
+    """Cheap DeepSeek yes/no on the result set. Fail open if the judge is missing or broken."""
     if not hits:
+        return False
+    if judge is None:
         return True
-    kept = relevant_hits(hits, query)
-    if not kept:
+    try:
+        raw = await judge(search_judge_messages(query, hits))
+    except Exception:
+        _search_log.warning("search relevance judge failed for %r", query, exc_info=True)
         return True
-    return len(kept) / len(hits) < 0.4
+    verdict = parse_relevance_answer(raw)
+    if verdict is None:
+        _search_log.warning("search relevance judge returned %r for %r", raw, query)
+        return True
+    return verdict
 
 
 def merge_hits(groups: Iterable[Sequence[Dict[str, str]]], limit: int) -> List[Dict[str, str]]:
@@ -657,6 +689,7 @@ async def run_search(
     apify_token: str = "",
     fetch: Callable[..., Awaitable[tuple[int, str]]],
     now: Optional[float] = None,
+    judge: Optional[Callable[[List[Dict[str, str]]], Awaitable[str]]] = None,
 ) -> Dict[str, Any]:
     if not query.strip():
         raise ToolError(400, "query is required")
@@ -693,15 +726,14 @@ async def run_search(
             skipped.append({"engine": name, "reason": "error"})
             continue
         hits = parse_search_body(name, body)
-        if name != "apify" and search_hits_are_junk(hits, narrowed):
+        if name != "apify" and not await search_hits_are_relevant(narrowed, hits, judge=judge):
             _search_log.warning(
                 "search engine %s returned irrelevant hits for %r", name, narrowed
             )
             skipped.append({"engine": name, "reason": "irrelevant"})
             continue
-        kept = hits if name == "apify" else relevant_hits(hits, narrowed)
         used.append(name)
-        groups.append(kept)
+        groups.append(hits)
         if len(merge_hits(groups, limit)) >= limit:
             break
     hits = merge_hits(groups, limit)

@@ -38,12 +38,17 @@ async def complete(
     *,
     temperature: float = 0,
     json_mode: bool = False,
+    timeout: float = 60,
+    model: Optional[str] = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> str:
     """One non-streaming chat completion. Returns the assistant text."""
     settings = nanogpt_settings()
+    chosen = (model or settings["model"]).strip()
+    if chosen.startswith("openai/"):
+        chosen = chosen[7:]
     payload: Dict[str, Any] = {
-        "model": settings["model"],
+        "model": chosen,
         "messages": messages,
         "temperature": temperature,
         "stream": False,
@@ -70,5 +75,5 @@ async def complete(
 
     if client is not None:
         return await _post(client)
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx.AsyncClient(timeout=timeout) as http:
         return await _post(http)

@@ -75,6 +75,11 @@ async def _complete(messages: List[Dict[str, str]]) -> str:
         raise ToolError(status, exc.detail) from exc
 
 
+async def _judge_search(messages: List[Dict[str, str]]) -> str:
+    model = os.environ.get("SEARCH_JUDGE_MODEL", "deepseek/deepseek-v4-flash").strip() or None
+    return await complete(messages, timeout=8, model=model)
+
+
 def _markdown_text(result: Any, only_main: bool) -> str:
     markdown = getattr(result, "markdown", None)
     if markdown is None:
@@ -376,6 +381,7 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
                 categories=body.categories,
                 apify_token=_apify_token(),
                 fetch=_search_fetch,
+                judge=_judge_search,
             )
             if body.scrape:
                 hits = result["data"].get("web") or result["data"].get("news") or []
