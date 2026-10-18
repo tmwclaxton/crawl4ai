@@ -345,6 +345,28 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
     assert "memory=512" in search_request_url("apify", "grants", "web")[0]
 
 
+def test_engine_fetch_error_is_skipped():
+    async def boom(name, url, headers, payload=None):
+        if name == "duckduckgo":
+            raise TimeoutError("connect")
+        if name == "bing":
+            return 200, _read("bing.xml")
+        return 403, ""
+
+    result = asyncio.run(run_search(
+        "grant pricing",
+        limit=2,
+        sources="web",
+        categories=None,
+        apify_token="",
+        fetch=boom,
+        now=40000,
+    ))
+    assert {"engine": "duckduckgo", "reason": "error"} in result["engines_skipped"]
+    assert "bing" in result["engines_used"]
+    assert result["data"]["web"]
+
+
 def test_junk_bing_hits_fall_through_to_apify():
     junk = _read("bing_junk.xml")
     assert search_hits_are_junk(parse_search_body("bing", junk), "Infinitopes director linkedin") is True

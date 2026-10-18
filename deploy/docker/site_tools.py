@@ -674,12 +674,17 @@ async def run_search(
             continue
         url, headers = search_request_url(name, narrowed, source)
         payload = None
-        if name == "apify":
-            headers = {"Authorization": f"Bearer {apify_token}"}
-            payload = apify_input(narrowed, source)
-            status, body = await fetch(name, url, headers, payload)
-        else:
-            status, body = await fetch(name, url, headers)
+        try:
+            if name == "apify":
+                headers = {"Authorization": f"Bearer {apify_token}"}
+                payload = apify_input(narrowed, source)
+                status, body = await fetch(name, url, headers, payload)
+            else:
+                status, body = await fetch(name, url, headers)
+        except Exception:
+            _search_log.warning("search engine %s failed for %r", name, narrowed, exc_info=True)
+            skipped.append({"engine": name, "reason": "error"})
+            continue
         if is_blocked_search(status, body):
             cool_engine(name, clock)
             skipped.append({"engine": name, "reason": "blocked"})
