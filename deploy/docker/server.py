@@ -788,6 +788,17 @@ _HOOKS_CODE_WARNING = (
 )
 
 
+def _check_site_profile(crawl_request) -> None:
+    """400 for an unknown site_profile or a URL outside its hosts. Only
+    called when the caller opted in, so default requests never reach it."""
+    from site_profiles import SiteProfileError, validate_site_profile
+    urls = list(crawl_request.urls or [])
+    try:
+        crawl_request.site_profile = validate_site_profile(crawl_request.site_profile, urls)
+    except SiteProfileError as e:
+        raise HTTPException(400, str(e))
+
+
 def _reject_disabled_hooks(hooks) -> None:
     """403 for any hooks payload while hooks are disabled. Legacy inline code
     gets its own detail: enabling CRAWL4AI_HOOKS_ENABLED would not run it (the
@@ -1034,6 +1045,8 @@ async def crawl(
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and not HOOKS_ENABLED:
         _reject_disabled_hooks(crawl_request.hooks)
+    if crawl_request.site_profile is not None:
+        _check_site_profile(crawl_request)
     # Check whether it is a redirection for a streaming request
     try:
         crawler_config = CrawlerRunConfig.load(
@@ -1064,6 +1077,7 @@ async def crawl(
         and len(crawl_request.urls) == 1
         and not crawl_request.hooks
         and not crawl_request.crawler_configs
+        and crawl_request.site_profile is None
         and page_cache.cacheable_crawl(params)
     ):
         cache_url = crawl_request.urls[0]
@@ -1097,6 +1111,7 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        **({"site_profile": crawl_request.site_profile} if crawl_request.site_profile is not None else {}),
     )
     if cache_url is not None and page_cache.writes_cache(cache_mode):
         first = (results.get("results") or [None])[0] if isinstance(results, dict) else None
@@ -1121,6 +1136,8 @@ async def crawl_stream(
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and not HOOKS_ENABLED:
         _reject_disabled_hooks(crawl_request.hooks)
+    if crawl_request.site_profile is not None:
+        _check_site_profile(crawl_request)
 
     return await stream_process(crawl_request=crawl_request)
 
@@ -1139,7 +1156,8 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         browser_config=crawl_request.browser_config,
         crawler_config=crawl_request.crawler_config,
         config=config,
-        hooks_config=hooks_config
+        hooks_config=hooks_config,
+        **({"site_profile": crawl_request.site_profile} if crawl_request.site_profile is not None else {}),
     )
     
     # Add hooks info to response headers if available
