@@ -664,6 +664,7 @@ async def handle_crawl_request(
     config: dict,
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
+    site_profile: Optional[str] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -687,6 +688,9 @@ async def handle_crawl_request(
         urls = _normalize_and_validate_seeds(urls)
         browser_config = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
         crawler_config = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
+        if site_profile is not None:
+            from site_profiles import apply_site_profile
+            apply_site_profile(site_profile, browser_config)
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl
@@ -921,7 +925,8 @@ async def handle_stream_crawl_request(
     browser_config: dict,
     crawler_config: dict,
     config: dict,
-    hooks_config: Optional[dict] = None
+    hooks_config: Optional[dict] = None,
+    site_profile: Optional[str] = None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict]]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -936,6 +941,9 @@ async def handle_stream_crawl_request(
         )
         # browser_config.verbose = True # Set to False or remove for production stress testing
         browser_config.verbose = False
+        if site_profile is not None:
+            from site_profiles import apply_site_profile
+            apply_site_profile(site_profile, browser_config)
         from egress_broker import enforce_egress
 
         enforce_egress(browser_config)

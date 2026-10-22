@@ -16,6 +16,15 @@ class CrawlRequest(BaseModel):
             "to match against specific URLs. Takes precedence over crawler_config."
         ),
     )
+    site_profile: Optional[str] = Field(
+        default=None,
+        description=(
+            "Opt-in site profile. 'youtube' adds YouTube consent cookies "
+            "(SOCS/CONSENT) and an English Accept-Language header so channel "
+            "pages render instead of the EU consent wall. youtube.com URLs only. "
+            "Omit for the default behaviour."
+        ),
+    )
 
 
 class HookSpec(BaseModel):
