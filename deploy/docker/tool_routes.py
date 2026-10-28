@@ -382,6 +382,7 @@ def attach_tool_routes(app, limiter, token_dep, config, browser_config_factory, 
                 apify_token=_apify_token(),
                 fetch=_search_fetch,
                 judge=_judge_search,
+                fallback=body.fallback,
             )
             if body.scrape:
                 hits = result["data"].get("web") or result["data"].get("news") or []

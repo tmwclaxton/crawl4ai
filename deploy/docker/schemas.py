@@ -165,6 +165,7 @@ class SearchRequest(BaseModel):
     sources: str = Field("web", description="web or news")
     categories: Optional[str] = None
     scrape: bool = False
+    fallback: bool = True
 
 
 class SiteCrawlRequest(BaseModel):

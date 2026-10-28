@@ -70,6 +70,144 @@ def test_search_budget_preserves_finished_and_cancels_pending(monkeypatch):
     assert result["data"]["web"]
 
 
+def test_apify_skipped_when_fallback_false(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=10, sources="web", categories=None,
+            apify_token="tok", fetch=fetch, fallback=False,
+        )
+
+    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
+        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    ]):
+        result = asyncio.run(run())
+
+    assert "apify" not in calls
+    assert "apify" not in result["engines_used"]
+    assert all(item["engine"] != "apify" for item in result["engines_skipped"])
+
+
+def test_apify_skipped_with_deadline_reason_when_time_short(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        if name == "apify":
+            await asyncio.sleep(5)
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=10, sources="web", categories=None,
+            apify_token="tok", fetch=fetch, fallback=True, deadline_s=0.05,
+        )
+
+    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
+        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    ]):
+        start = time.monotonic()
+        result = asyncio.run(run())
+        elapsed = time.monotonic() - start
+
+    assert "apify" not in calls
+    assert {"engine": "apify", "reason": "deadline"} in result["engines_skipped"]
+    assert elapsed < 1
+
+
+def test_apify_call_cut_at_deadline(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    monkeypatch.setenv("SEARCH_APIFY_MIN_S", "0")
+    from unittest.mock import patch
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        if name == "apify":
+            await asyncio.sleep(5)
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=10, sources="web", categories=None,
+            apify_token="tok", fetch=fetch, fallback=True, deadline_s=0.2,
+        )
+
+    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
+        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    ]):
+        start = time.monotonic()
+        result = asyncio.run(run())
+        elapsed = time.monotonic() - start
+
+    assert calls.count("apify") == 1
+    assert {"engine": "apify", "reason": "deadline"} in result["engines_skipped"]
+    assert elapsed < 1
+
+
+def test_low_relevance_hits_returned_when_nothing_else(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    async def fetch(name, url, headers, payload=None):
+        return 200, name
+
+    async def judge(messages):
+        return "NO"
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=5, sources="web", categories=None,
+            fetch=fetch, judge=judge,
+        )
+
+    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
+        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    ]):
+        result = asyncio.run(run())
+
+    hits = result["data"]["web"]
+    assert hits
+    assert all(hit.get("low_relevance") is True for hit in hits)
+    assert all(item["reason"] == "irrelevant" for item in result["engines_skipped"])
+
+
+def test_elapsed_ms_present(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    async def fetch(name, url, headers, payload=None):
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search("query", limit=3, sources="web", categories=None, fetch=fetch)
+
+    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
+        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    ]):
+        result = asyncio.run(run())
+
+    assert isinstance(result["elapsed_ms"], int)
+    assert result["elapsed_ms"] >= 0
+
+
 def test_accumulator_and_middleware(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
 
