@@ -330,6 +330,247 @@ async def process_llm_extraction(
             error=str(e)
         )
 
+def _combined_fallback_detail(browser: str, http: str, proxy: str) -> str:
+    return f"browser: {browser}; http: {http}; proxy: {proxy}"
+
+
+def _looks_like_html(content_type: Optional[str]) -> bool:
+    """True for a missing/absent content-type (assume HTML, the common case
+    for a misconfigured server) or one that names text/HTML/XML. False for
+    anything else (images, JSON APIs, octet-stream...) so the plain-HTTP
+    fallback doesn't silently feed binary garbage into the markdown pipeline."""
+    if not content_type:
+        return True
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return mime.startswith("text/") or mime in (
+        "application/xhtml+xml", "application/xml",
+    )
+
+
+def _extract_markdown(result, filter_type: FilterType) -> str:
+    if not getattr(result, "success", False):
+        return ""
+    markdown = result.markdown
+    text = markdown.raw_markdown if filter_type == FilterType.RAW else markdown.fit_markdown
+    return text or ""
+
+
+def _markdown_run_config(md_generator, cache_mode) -> CrawlerRunConfig:
+    return CrawlerRunConfig(
+        markdown_generator=md_generator,
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        cache_mode=cache_mode,
+    )
+
+
+def _build_markdown_generator(
+    filter_type: FilterType,
+    query: Optional[str],
+    config: Optional[dict],
+    provider: Optional[str],
+    temperature: Optional[float],
+) -> DefaultMarkdownGenerator:
+    if filter_type == FilterType.RAW:
+        return DefaultMarkdownGenerator()
+    # Provider by name only; base_url/api_token are server-derived.
+    from llm_broker import resolve_llm
+    _llm = resolve_llm(config, provider)
+    content_filter = {
+        FilterType.FIT: PruningContentFilterLXML(),
+        FilterType.BM25: BM25ContentFilter(user_query=query or ""),
+        FilterType.LLM: LLMContentFilter(
+            llm_config=LLMConfig(
+                provider=_llm["provider"],
+                api_token=_llm["api_token"],
+                temperature=temperature or _llm["temperature"],
+                base_url=_llm["base_url"],
+            ),
+            instruction=query or "Extract main content"
+        )
+    }[filter_type]
+    return DefaultMarkdownGenerator(content_filter=content_filter)
+
+
+async def _retry_through_proxy_tiers(url: str, attempt):
+    """Call `attempt()` once per configured DataImpulse tier (cheapest
+    first), each inside egress_proxy.use_request_upstream so the pinning
+    proxy chains to that tier - the same mechanism proxy_fallback.py uses
+    for /crawl. `attempt` must return a truthy value on success. Returns
+    (result, tier_name) on the first success, else (None, a description of
+    what was tried) once every tier has been exhausted.
+    """
+    from proxy_fallback import configured_tiers, proxy_fallback_enabled, skip_paid_proxy
+    if not proxy_fallback_enabled():
+        return None, "disabled"
+    if skip_paid_proxy(url):
+        return None, "skipped (image SERP)"
+    from egress_proxy import use_request_upstream
+    tried = []
+    for name, proxy_url in configured_tiers():
+        tried.append(name)
+        try:
+            logger.warning("md: DataImpulse %s retrying %s", name, url)
+            async with use_request_upstream(proxy_url):
+                result = await attempt()
+        except Exception:
+            logger.warning("md: DataImpulse %s retry failed for %s", name, url, exc_info=True)
+            continue
+        if result:
+            return result, name
+    return None, (f"tried {', '.join(tried)}" if tried else "no tiers configured")
+
+
+async def _html_bytes_to_markdown(crawler, html: str, md_generator, filter_type: FilterType) -> str:
+    """Run caller-fetched HTML through the same markdown generator a normal
+    crawl would use (so fit/bm25/llm filters still apply), via the raw:
+    pseudo-URL, which renders the string without navigating anywhere. Falls
+    back to a plain tag-stripping conversion if that fails for any reason."""
+    try:
+        result = await crawler.arun(
+            url="raw:" + html,
+            config=_markdown_run_config(md_generator, CacheMode.BYPASS),
+        )
+        text = _extract_markdown(result, filter_type)
+        if text:
+            return text
+    except Exception:
+        logger.warning("md: raw-HTML markdown conversion failed", exc_info=True)
+    from doc_parse import html_to_markdown
+    return html_to_markdown(html)
+
+
+def _document_markdown(
+    url: str, content_type: Optional[str], data: bytes, filter_type: FilterType, query: Optional[str]
+) -> str:
+    from md_fallback import filter_document_text, parse_document_bytes
+    text = parse_document_bytes(url, content_type, data)
+    return filter_document_text(text, filter_type, query)
+
+
+async def _document_url_fallback(
+    url: str, filter_type: FilterType, query: Optional[str]
+) -> Tuple[str, str]:
+    """A URL whose path already names a document type. The browser can't
+    navigate to a file download, so skip it entirely: fetch the bytes over
+    plain HTTP and parse them, retrying through DataImpulse tiers (plain
+    HTTP, not the browser - a browser retry would just repeat the same
+    navigation failure) if the direct fetch is blocked or errors out."""
+    from doc_parse import ParseError
+    from md_fallback import PlainFetchError, plain_http_get
+
+    http_detail = "unknown"
+    fetch_status = fetch_headers = fetch_content = fetch_final_url = None
+    try:
+        fetch_status, fetch_headers, fetch_content, fetch_final_url = await plain_http_get(url)
+        if fetch_status >= 400:
+            http_detail = f"HTTP {fetch_status}"
+            fetch_status = None
+    except PlainFetchError as exc:
+        http_detail = exc.reason
+
+    if fetch_status is not None:
+        source = "document"
+        proxy_detail = "not tried (plain HTTP succeeded)"
+    else:
+        logger.warning("md: document fetch failed for %s: %s", url, http_detail)
+
+        async def _attempt_document_fetch():
+            fs, fh, fc, fu = await plain_http_get(url)
+            return (fs, fh, fc, fu) if fs < 400 else None
+
+        fetched, proxy_detail = await _retry_through_proxy_tiers(url, _attempt_document_fetch)
+        if not fetched:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_combined_fallback_detail("skipped (document URL)", http_detail, proxy_detail),
+            )
+        fetch_status, fetch_headers, fetch_content, fetch_final_url = fetched
+        source = f"proxy-{proxy_detail}"
+
+    try:
+        text = _document_markdown(fetch_final_url, fetch_headers.get("content-type"), fetch_content, filter_type, query)
+    except ParseError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=_combined_fallback_detail("skipped (document URL)", "document had no extractable text", proxy_detail),
+        )
+    return text, source
+
+
+async def _recover_after_browser_failure(
+    crawler,
+    url: str,
+    filter_type: FilterType,
+    query: Optional[str],
+    md_generator,
+    cache_mode,
+    browser_detail: str,
+) -> Tuple[str, str]:
+    """The browser crawl failed (anti-bot, network error, navigation
+    failure...) or returned empty markdown. Try a plain HTTP GET next, and
+    if that fails too, replay the browser crawl through the DataImpulse
+    proxy tiers (exactly as proxy_fallback.fill_failed_with_proxy does for
+    /crawl) before giving up with a combined error."""
+    from doc_parse import ParseError
+    from md_fallback import (
+        PlainFetchError, is_document_content_type, is_document_url,
+        is_navigation_failure, plain_http_get,
+    )
+
+    logger.warning(
+        "md: browser failed or empty for %s: %s%s", url, browser_detail,
+        " (navigation failure - likely a download)" if is_navigation_failure(browser_detail) else "",
+    )
+
+    http_detail = "unknown"
+    fetch_status = fetch_headers = fetch_content = fetch_final_url = None
+    try:
+        fetch_status, fetch_headers, fetch_content, fetch_final_url = await plain_http_get(url)
+        if fetch_status >= 400:
+            http_detail = f"HTTP {fetch_status}"
+            fetch_status = None
+    except PlainFetchError as exc:
+        http_detail = exc.reason
+
+    if fetch_status is not None:
+        content_type = fetch_headers.get("content-type")
+        if is_document_url(fetch_final_url) or is_document_content_type(content_type):
+            try:
+                text = _document_markdown(fetch_final_url, content_type, fetch_content, filter_type, query)
+            except ParseError as exc:
+                text = ""
+                http_detail = exc.detail
+            if text:
+                return text, "document"
+            http_detail = http_detail if http_detail != "unknown" else "document had no extractable text"
+        elif _looks_like_html(content_type):
+            html = fetch_content.decode("utf-8", errors="replace")
+            text = await _html_bytes_to_markdown(crawler, html, md_generator, filter_type)
+            if text:
+                return text, "http"
+            http_detail = "empty markdown from plain HTTP"
+        else:
+            http_detail = f"unsupported content-type: {content_type or 'unknown'}"
+
+    logger.warning("md: plain HTTP fallback failed for %s: %s", url, http_detail)
+
+    async def _attempt_browser():
+        result = await crawler.arun(url=url, config=_markdown_run_config(md_generator, cache_mode))
+        return _extract_markdown(result, filter_type) or None
+
+    markdown, proxy_detail = await _retry_through_proxy_tiers(url, _attempt_browser)
+    if markdown:
+        return markdown, f"proxy-{proxy_detail}"
+
+    logger.warning("md: proxy fallback exhausted for %s: %s", url, proxy_detail)
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=_combined_fallback_detail(browser_detail, http_detail, proxy_detail),
+    )
+
+
 async def handle_markdown_request(
     url: str,
     filter_type: FilterType,
@@ -339,8 +580,12 @@ async def handle_markdown_request(
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None
-) -> str:
-    """Handle markdown generation requests."""
+) -> Tuple[str, str]:
+    """Handle markdown generation requests.
+
+    Returns (markdown, source) where source is one of "browser", "http",
+    "document", or "proxy-<tier>", describing which fallback produced it.
+    """
     crawler = None
     try:
         # Validate provider if using LLM filter
@@ -356,27 +601,13 @@ async def handle_markdown_request(
             decoded_url = 'https://' + decoded_url
         validate_url_destination(decoded_url)
 
-        if filter_type == FilterType.RAW:
-            md_generator = DefaultMarkdownGenerator()
-        else:
-            # Provider by name only; base_url/api_token are server-derived.
-            from llm_broker import resolve_llm
-            _llm = resolve_llm(config, provider)
-            content_filter = {
-                FilterType.FIT: PruningContentFilterLXML(),
-                FilterType.BM25: BM25ContentFilter(user_query=query or ""),
-                FilterType.LLM: LLMContentFilter(
-                    llm_config=LLMConfig(
-                        provider=_llm["provider"],
-                        api_token=_llm["api_token"],
-                        temperature=temperature or _llm["temperature"],
-                        base_url=_llm["base_url"],
-                    ),
-                    instruction=query or "Extract main content"
-                )
-            }[filter_type]
-            md_generator = DefaultMarkdownGenerator(content_filter=content_filter)
+        is_http_url = decoded_url.startswith(("http://", "https://"))
+        if is_http_url:
+            from md_fallback import is_document_url
+            if is_document_url(decoded_url):
+                return await _document_url_fallback(decoded_url, filter_type, query)
 
+        md_generator = _build_markdown_generator(filter_type, query, config, provider, temperature)
         cache_mode = CacheMode.ENABLED if cache == "1" else CacheMode.WRITE_ONLY
 
         from crawler_pool import get_crawler, release_crawler
@@ -391,18 +622,22 @@ async def handle_markdown_request(
         crawler = await get_crawler(browser_cfg)
         result = await crawler.arun(
             url=decoded_url,
-            config=CrawlerRunConfig(
-                markdown_generator=md_generator,
-                scraping_strategy=LXMLWebScrapingStrategy(),
-                cache_mode=cache_mode
-            )
+            config=_markdown_run_config(md_generator, cache_mode),
         )
 
-        _raise_for_crawl_failure(result)
+        markdown = _extract_markdown(result, filter_type)
+        if markdown:
+            return markdown, "browser"
 
-        return (result.markdown.raw_markdown
-               if filter_type == FilterType.RAW
-               else result.markdown.fit_markdown)
+        browser_detail = result.error_message or "empty markdown"
+        if not is_http_url:
+            # raw: HTML input with nothing extracted - there is no network
+            # fallback that could help.
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=browser_detail)
+
+        return await _recover_after_browser_failure(
+            crawler, decoded_url, filter_type, query, md_generator, cache_mode, browser_detail,
+        )
 
     except HTTPException:
         raise

@@ -1,7 +1,8 @@
 """Turn an uploaded document into markdown.
 
 PDF uses pypdf. DOCX uses python-docx. XLSX uses openpyxl.
-HTML, ODT, and RTF are read in-process. Legacy .doc and .xls are rejected.
+HTML, ODT, and RTF are read in-process. Legacy .doc gets a best-effort text
+scrape (see _doc). Legacy .xls is rejected.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from xml.etree import ElementTree
 
 MAX_PARSE_BYTES = 8 * 1024 * 1024
 
-_UNSUPPORTED = {".doc", ".xls"}
+_UNSUPPORTED = {".xls"}
 
 
 class ParseError(Exception):
@@ -34,6 +35,8 @@ def parse_document(filename: str, data: bytes) -> str:
         raise ParseError(400, f"{suffix} is not supported. Convert it to docx or xlsx first.")
     if suffix == ".pdf":
         return _pdf(data)
+    if suffix == ".doc":
+        return _doc(data)
     if suffix == ".docx":
         return _docx(data)
     if suffix in {".xlsx", ".xlsm"}:
@@ -61,6 +64,40 @@ def _pdf(data: bytes) -> str:
     for page in reader.pages:
         parts.append(page.extract_text() or "")
     return "\n\n".join(part.strip() for part in parts if part.strip())
+
+
+_DOC_RUN_RE = re.compile(r"[\t\n\r\x20-\x7e\xa0-\xff]{4,}")
+
+
+def _doc(data: bytes) -> str:
+    """Best-effort text scrape for legacy OLE2 (.doc, Word 97-2003) files.
+
+    This is not a real Word binary-format parser (no FIB / piece-table
+    handling), just a scan for readable text runs. Word 97+ stores text
+    either all-cp1252 or all-UTF16LE depending on a FIB flag we don't read,
+    so both decodings are tried and whichever one is right contributes the
+    real runs while the other mostly dissolves into sub-4-char noise that
+    gets dropped. Good enough to recover body text from a file curl can
+    fetch but a browser can't navigate to; never raises on malformed input.
+    """
+    stream = data
+    try:
+        import olefile
+
+        ole = olefile.OleFileIO(io.BytesIO(data))
+        try:
+            if ole.exists("WordDocument"):
+                stream = ole.openstream("WordDocument").read()
+        finally:
+            ole.close()
+    except Exception:
+        stream = data
+
+    runs = _DOC_RUN_RE.findall(stream.decode("utf-16-le", errors="ignore"))
+    runs += _DOC_RUN_RE.findall(stream.decode("cp1252", errors="ignore"))
+    lines = [re.sub(r"[ \t]+", " ", run).strip() for run in runs]
+    lines = [line for line in lines if len(line) >= 4]
+    return "\n\n".join(lines)
 
 
 def _docx(data: bytes) -> str:

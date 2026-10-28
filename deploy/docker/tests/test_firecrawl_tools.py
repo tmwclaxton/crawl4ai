@@ -602,7 +602,7 @@ def _tiny_pdf() -> bytes:
     return bytes(output)
 
 
-def test_parse_pdf_html_docx_xlsx_odt_rtf_and_rejects_legacy():
+def test_parse_pdf_html_docx_xlsx_odt_rtf_doc_and_rejects_xls():
     assert "Hello from crawl4ai" in parse_document("paper.pdf", _tiny_pdf())
     assert "Grant pricing" in parse_document("page.html", _read("page.html").encode())
 
@@ -639,9 +639,12 @@ def test_parse_pdf_html_docx_xlsx_odt_rtf_and_rejects_legacy():
     assert "Hello from odt" in parse_document("notes.odt", odt.getvalue())
     assert "Hello from rtf" in parse_document("notes.rtf", br"{\rtf1\ansi Hello from rtf}")
 
-    with pytest.raises(ParseError) as legacy:
-        parse_document("old.doc", b"not a real doc")
-    assert legacy.value.status == 400
+    # .doc gets a best-effort text scrape now (not a real OLE2/Word parser,
+    # but good enough to recover body text); it must not raise, even on
+    # input that isn't a real .doc file.
+    assert parse_document("old.doc", b"not a real doc") == "not a real doc"
+    doc_text = "Hello from doc".encode("utf-16-le")
+    assert "Hello from doc" in parse_document("old.doc", doc_text)
     with pytest.raises(ParseError):
         parse_document("old.xls", b"not a real xls")
     with pytest.raises(ParseError) as huge:
