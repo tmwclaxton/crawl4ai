@@ -6,9 +6,11 @@ The live server passes the real crawler and HTTP client.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
+import os
 import re
 import time
 import zipfile
@@ -520,7 +522,7 @@ def search_request_url(engine: str, query: str, source: str) -> tuple[str, Dict[
         return f"{base}?q={encoded}&format=json{category}", headers
     if engine == "apify":
         return (
-            "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?timeout=120&memory=512",
+            "https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?timeout=60&memory=512",
             {},
         )
     raise ToolError(400, f"Unknown search engine {engine}")
@@ -701,41 +703,66 @@ async def run_search(
     groups = []
     used = []
     skipped = []
-    for name in engine_names(apify_token):
+
+    async def search_engine(name):
         if engine_cooled(name, clock):
-            skipped.append({"engine": name, "reason": "cooldown"})
-            continue
+            return None, "cooldown"
         url, headers = search_request_url(name, narrowed, source)
-        payload = None
         try:
             if name == "apify":
                 headers = {"Authorization": f"Bearer {apify_token}"}
-                payload = apify_input(narrowed, source)
-                status, body = await fetch(name, url, headers, payload)
+                status, body = await fetch(name, url, headers, apify_input(narrowed, source))
             else:
                 status, body = await fetch(name, url, headers)
+            if is_blocked_search(status, body):
+                cool_engine(name, clock)
+                return None, "blocked"
+            if status >= 400:
+                return None, "error"
+            hits = parse_search_body(name, body)
+            if name != "apify" and not await search_hits_are_relevant(narrowed, hits, judge=judge):
+                _search_log.warning("search engine %s returned irrelevant hits for %r", name, narrowed)
+                return None, "irrelevant"
+            return hits, None
         except Exception:
             _search_log.warning("search engine %s failed for %r", name, narrowed, exc_info=True)
-            skipped.append({"engine": name, "reason": "error"})
-            continue
-        if is_blocked_search(status, body):
-            cool_engine(name, clock)
-            skipped.append({"engine": name, "reason": "blocked"})
-            continue
-        if status >= 400:
-            skipped.append({"engine": name, "reason": "error"})
-            continue
-        hits = parse_search_body(name, body)
-        if name != "apify" and not await search_hits_are_relevant(narrowed, hits, judge=judge):
-            _search_log.warning(
-                "search engine %s returned irrelevant hits for %r", name, narrowed
-            )
-            skipped.append({"engine": name, "reason": "irrelevant"})
-            continue
-        used.append(name)
-        groups.append(hits)
-        if len(merge_hits(groups, limit)) >= limit:
-            break
+            return None, "error"
+
+    names = engine_names()
+    tasks = [asyncio.create_task(search_engine(name)) for name in names]
+    gather = asyncio.gather(*tasks)
+    try:
+        budget = max(0.0, float(os.environ.get("SEARCH_FREE_BUDGET_S", "12")))
+    except ValueError:
+        budget = 12.0
+    try:
+        await asyncio.wait_for(asyncio.shield(gather), timeout=budget)
+    except asyncio.TimeoutError:
+        # Preserve completed engines and cancel only work still pending.
+        _, pending = await asyncio.wait(tasks, timeout=0)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        if not gather.done():
+            gather.cancel()
+        try:
+            await gather
+        except asyncio.CancelledError:
+            pass
+
+    def record(name, result):
+        hits, reason = result
+        if reason:
+            skipped.append({"engine": name, "reason": reason})
+        else:
+            used.append(name)
+            groups.append(hits)
+
+    for name, task in zip(names, tasks):
+        record(name, (None, "error") if task.cancelled() else task.result())
+    if apify_token and len(merge_hits(groups, limit)) < limit:
+        record("apify", await search_engine("apify"))
     hits = merge_hits(groups, limit)
     bucket = "news" if source == "news" else "web"
     return {

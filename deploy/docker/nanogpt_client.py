@@ -8,9 +8,13 @@ A request cannot supply either value.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+
+request_usage: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar("nanogpt_request_usage", default=None)
 
 
 class NanoGPTError(RuntimeError):
@@ -69,9 +73,22 @@ async def complete(
             raise NanoGPTError(response.status_code, "NanoGPT request failed")
         body = response.json()
         try:
-            return body["choices"][0]["message"]["content"] or ""
+            content = body["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise NanoGPTError(502, "NanoGPT returned an unexpected body") from exc
+        try:
+            calls = request_usage.get()
+            if calls is not None:
+                usage = body.get("usage") or {}
+                calls.append({
+                    "model": body.get("model") or chosen,
+                    "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                    "completion_tokens": int(usage.get("completion_tokens") or 0),
+                    "cost": body.get("cost", usage.get("cost")),
+                })
+        except Exception:
+            pass
+        return content
 
     if client is not None:
         return await _post(client)

@@ -58,7 +58,7 @@ async def _search_fetch(
 ):
     import httpx
 
-    timeout = 120 if payload is not None else 12
+    timeout = 60 if payload is not None else 8
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         if payload is None:
             response = await client.get(url, headers=headers)
