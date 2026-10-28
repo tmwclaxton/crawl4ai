@@ -692,15 +692,24 @@ async def run_search(
     fetch: Callable[..., Awaitable[tuple[int, str]]],
     now: Optional[float] = None,
     judge: Optional[Callable[[List[Dict[str, str]]], Awaitable[str]]] = None,
+    fallback: bool = True,
+    deadline_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not query.strip():
         raise ToolError(400, "query is required")
     if limit < 1:
         raise ToolError(400, "limit must be at least 1")
+    start = time.monotonic()
+    if deadline_s is None:
+        try:
+            deadline_s = max(0.0, float(os.environ.get("SEARCH_TOTAL_DEADLINE_S", "20")))
+        except ValueError:
+            deadline_s = 20.0
     source = "news" if sources == "news" else "web"
     narrowed = narrow_query(query.strip(), categories)
     clock = time.time() if now is None else now
     groups = []
+    irrelevant_groups = []
     used = []
     skipped = []
 
@@ -722,7 +731,7 @@ async def run_search(
             hits = parse_search_body(name, body)
             if name != "apify" and not await search_hits_are_relevant(narrowed, hits, judge=judge):
                 _search_log.warning("search engine %s returned irrelevant hits for %r", name, narrowed)
-                return None, "irrelevant"
+                return hits, "irrelevant"
             return hits, None
         except Exception:
             _search_log.warning("search engine %s failed for %r", name, narrowed, exc_info=True)
@@ -755,15 +764,34 @@ async def run_search(
         hits, reason = result
         if reason:
             skipped.append({"engine": name, "reason": reason})
+            if reason == "irrelevant" and hits:
+                irrelevant_groups.append(hits)
         else:
             used.append(name)
             groups.append(hits)
 
     for name, task in zip(names, tasks):
         record(name, (None, "error") if task.cancelled() else task.result())
-    if apify_token and len(merge_hits(groups, limit)) < limit:
-        record("apify", await search_engine("apify"))
+
+    if fallback and apify_token and len(merge_hits(groups, limit)) < limit:
+        try:
+            apify_min_s = max(0.0, float(os.environ.get("SEARCH_APIFY_MIN_S", "5")))
+        except ValueError:
+            apify_min_s = 5.0
+        remaining = deadline_s - (time.monotonic() - start)
+        if remaining < apify_min_s:
+            skipped.append({"engine": "apify", "reason": "deadline"})
+        else:
+            try:
+                record("apify", await asyncio.wait_for(search_engine("apify"), timeout=remaining))
+            except asyncio.TimeoutError:
+                skipped.append({"engine": "apify", "reason": "deadline"})
+
     hits = merge_hits(groups, limit)
+    if not hits:
+        hits = merge_hits(irrelevant_groups, limit)
+        for hit in hits:
+            hit["low_relevance"] = True
     bucket = "news" if source == "news" else "web"
     return {
         "success": True,
@@ -771,6 +799,7 @@ async def run_search(
         "engines_used": used,
         "engines_skipped": skipped,
         "query": narrowed,
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
     }
 
 
