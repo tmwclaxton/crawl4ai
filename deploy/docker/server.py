@@ -573,6 +573,8 @@ import usage_log
 usage_log.init(redis)
 app.include_router(usage_log.router)
 app.add_middleware(usage_log.UsageLogMiddleware)
+from llm_usage import LLMUsageMiddleware
+app.add_middleware(LLMUsageMiddleware)
 
 logger = logging.getLogger(__name__)
 
@@ -693,10 +695,22 @@ async def get_markdown(
                 })
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
-    markdown, md_source = await handle_markdown_request(
-        body.url, body.f, body.q, body.c, config, body.provider,
-        body.temperature
-    )
+    try:
+        budget = float(os.environ.get("MD_TOTAL_BUDGET_S", "28"))
+    except ValueError:
+        budget = 28.0
+    try:
+        markdown, md_source = await asyncio.wait_for(
+            handle_markdown_request(
+                body.url, body.f, body.q, body.c, config, body.provider,
+                body.temperature,
+            ),
+            timeout=budget if budget > 0 else None,
+        )
+    except asyncio.TimeoutError as exc:
+        detail = f"md budget exceeded after {budget:g}s (browser, http and proxy tiers)"
+        logger.warning("%s: %s", detail, body.url)
+        raise HTTPException(status_code=504, detail=detail) from exc
     if use_cache and markdown and str(body.c).lower() not in {"disabled", "read_only"}:
         await page_cache.cache_put(
             body.url,

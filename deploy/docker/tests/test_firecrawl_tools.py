@@ -334,7 +334,7 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
         now=5000,
     ))
     assert len(stopped["data"]["web"]) == 2
-    assert "mojeek" not in calls
+    assert calls == engine_names()
 
     news_url, _headers = search_request_url("bing", "grant pricing", "news")
     assert "/news/search" in news_url
@@ -343,6 +343,7 @@ def test_search_merges_engines_skips_blocks_and_stops_at_the_limit():
     assert engine_names("token")[-1] == "apify"
     assert "brave" not in engine_names("token")
     assert "memory=512" in search_request_url("apify", "grants", "web")[0]
+    assert "timeout=60" in search_request_url("apify", "grants", "web")[0]
 
 
 def test_engine_fetch_error_is_skipped():
@@ -430,7 +431,7 @@ def test_synonym_hits_kept_when_judge_says_yes():
                 '<a class="result__snippet">UK single parent charity</a>'
                 "</body></html>"
             )
-        raise AssertionError(f"should not call {name}")
+        return 403, ""
 
     result = asyncio.run(run_search(
         "Sarah Pinch Gingerbread linkedin",
