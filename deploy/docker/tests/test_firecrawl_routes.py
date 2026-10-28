@@ -32,9 +32,11 @@ def test_scrape_and_parse_reject_bad_input(stock_client, server_module, monkeypa
     headers = {"Authorization": f"Bearer {API_KEY}"}
     scrape = stock_client.post("/scrape", json={"urls": ["javascript:alert(1)"]}, headers=headers)
     assert scrape.status_code == 400
+    # .doc now gets a best-effort text scrape (no longer rejected); .xls
+    # still is, so use that to exercise /parse's bad-input rejection.
     parsed = stock_client.post(
         "/parse",
-        json={"filename": "old.doc", "data_base64": "bm90IGEgZG9j"},
+        json={"filename": "old.xls", "data_base64": "bm90IGEgZG9j"},
         headers=headers,
     )
     assert parsed.status_code == 400

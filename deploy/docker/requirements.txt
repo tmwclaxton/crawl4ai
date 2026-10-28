@@ -17,3 +17,4 @@ httpx[http2]>=0.27.2
 pypdf>=6.0.0
 python-docx>=1.1.2
 openpyxl>=3.1.5
+olefile>=0.47
