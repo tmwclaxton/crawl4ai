@@ -9,7 +9,7 @@ import pytest
 
 from llm_usage import LLMUsageMiddleware, usage_header
 from nanogpt_client import complete, request_usage
-from site_tools import engine_names, reset_search_state, run_search
+from site_tools import engine_names, reset_search_state, run_search, search_judge_messages
 
 
 def test_search_fetch_and_judge_concurrent():
@@ -97,6 +97,118 @@ def test_apify_skipped_when_fallback_false(monkeypatch):
     assert all(item["engine"] != "apify" for item in result["engines_skipped"])
 
 
+def test_apify_skipped_when_free_hits_are_enough(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=5, sources="web", categories=None,
+            apify_token="tok", fetch=fetch, fallback=True,
+        )
+
+    # duckduckgo, bing, and mojeek each contribute a distinct relevant hit,
+    # three hits is the default SEARCH_APIFY_MIN_FREE_HITS, so apify should
+    # not be called even though limit (5) is higher than that.
+    def hits_for(name, body):
+        if name == "duckduckgo":
+            return [{"url": "https://ddg.example/", "title": "query", "description": "query", "engine": name}]
+        if name == "bing":
+            return [{"url": "https://bing.example/", "title": "query", "description": "query", "engine": name}]
+        if name == "mojeek":
+            return [{"url": "https://mojeek.example/", "title": "query", "description": "query", "engine": name}]
+        return []
+
+    with patch("site_tools.parse_search_body", side_effect=hits_for):
+        result = asyncio.run(run())
+
+    assert "apify" not in calls
+    assert "apify" not in result["engines_used"]
+
+
+def test_apify_called_when_free_hits_are_few(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
+    from unittest.mock import patch
+
+    calls = []
+
+    async def fetch(name, url, headers, payload=None):
+        calls.append(name)
+        return 200, name
+
+    async def run():
+        reset_search_state()
+        return await run_search(
+            "query", limit=5, sources="web", categories=None,
+            apify_token="tok", fetch=fetch, fallback=True,
+        )
+
+    # Only duckduckgo returns a hit, one relevant hit is fewer than
+    # min(limit, SEARCH_APIFY_MIN_FREE_HITS) = 3, so apify is called.
+    def hits_for(name, body):
+        if name == "duckduckgo":
+            return [{"url": "https://ddg.example/", "title": "query", "description": "query", "engine": name}]
+        return []
+
+    with patch("site_tools.parse_search_body", side_effect=hits_for):
+        result = asyncio.run(run())
+
+    assert "apify" in calls
+    assert "apify" in result["engines_used"]
+
+
+def test_early_finish_skips_slow_engine_once_enough_hits_are_in(monkeypatch):
+    monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "12")
+    monkeypatch.setenv("SEARCH_EARLY_GRACE_S", "0.2")
+    from unittest.mock import patch
+
+    async def run():
+        reset_search_state()
+
+        async def fetch(name, url, headers):
+            if name == "bing":
+                await asyncio.sleep(5)
+            return 200, name
+
+        start = time.monotonic()
+        result = await run_search("query", limit=5, sources="web", categories=None, fetch=fetch)
+        return result, time.monotonic() - start
+
+    # duckduckgo returns five relevant hits by itself, well past the default
+    # SEARCH_APIFY_MIN_FREE_HITS of 3, so bing should be cut short instead of
+    # waited on for its full 5 second sleep.
+    def hits_for(name, body):
+        if name == "duckduckgo":
+            return [
+                {"url": f"https://ddg.example/{i}", "title": "query", "description": "query", "engine": name}
+                for i in range(5)
+            ]
+        return []
+
+    with patch("site_tools.parse_search_body", side_effect=hits_for):
+        result, elapsed = asyncio.run(run())
+
+    assert elapsed < 3
+    assert len(result["data"]["web"]) == 5
+    assert {"engine": "bing", "reason": "early"} in result["engines_skipped"]
+
+
+def test_judge_prompt_asks_for_at_least_two_useful_results():
+    messages = search_judge_messages("grant query", [
+        {"url": "https://example.com/", "title": "t", "description": "d"},
+    ])
+    system_text = messages[0]["content"]
+    assert "at least two results" in system_text
+    assert "Reply with only YES or NO" in system_text
+
+
 def test_apify_skipped_with_deadline_reason_when_time_short(monkeypatch):
     monkeypatch.setenv("SEARCH_FREE_BUDGET_S", "1")
     from unittest.mock import patch
@@ -116,8 +228,10 @@ def test_apify_skipped_with_deadline_reason_when_time_short(monkeypatch):
             apify_token="tok", fetch=fetch, fallback=True, deadline_s=0.05,
         )
 
-    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
-        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    # All free engines collapse to the same URL, so the merged free hit count
+    # stays below the apify-skip threshold and the fallback is still attempted.
+    with patch("site_tools.parse_search_body", return_value=[
+        {"url": "https://example.com/", "title": "query", "description": "query", "engine": "free"}
     ]):
         start = time.monotonic()
         result = asyncio.run(run())
@@ -148,8 +262,10 @@ def test_apify_call_cut_at_deadline(monkeypatch):
             apify_token="tok", fetch=fetch, fallback=True, deadline_s=0.2,
         )
 
-    with patch("site_tools.parse_search_body", side_effect=lambda name, body: [
-        {"url": f"https://{name}.example/", "title": "query", "description": "query", "engine": name}
+    # All free engines collapse to the same URL, so the merged free hit count
+    # stays below the apify-skip threshold and the fallback is still attempted.
+    with patch("site_tools.parse_search_body", return_value=[
+        {"url": "https://example.com/", "title": "query", "description": "query", "engine": "free"}
     ]):
         start = time.monotonic()
         result = asyncio.run(run())
