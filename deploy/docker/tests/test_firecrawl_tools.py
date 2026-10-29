@@ -472,7 +472,11 @@ def test_judge_failure_keeps_engine_hits():
     assert result["data"]["web"]
 
 
-def test_apify_runs_only_after_free_engines_and_parses_organic_results():
+def test_apify_runs_only_after_free_engines_and_parses_organic_results(monkeypatch):
+    # ddg.html has 3 hits, which now meets the default free-hit threshold on
+    # its own. Raise the threshold so this test keeps exercising the apify
+    # call and its result parsing.
+    monkeypatch.setenv("SEARCH_APIFY_MIN_FREE_HITS", "4")
     body = _read("apify.json")
     parsed = parse_search_body("apify", body)
     assert parsed[0]["url"] == "https://docs.python.org/3/library/itertools.html"

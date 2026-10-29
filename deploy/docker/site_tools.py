@@ -129,10 +129,12 @@ def search_judge_messages(query: str, hits: Sequence[Dict[str, str]]) -> List[Di
             "content": (
                 "You judge whether a search result list matches the user's query. "
                 "Reply with only YES or NO. "
-                "YES if most results are about the same people, organisation, role, or subject. "
-                "Synonyms, job titles, company names, and LinkedIn profiles count as relevant. "
-                "NO if the list is unrelated, generic shopping, captcha, empty, or random news "
-                "that only shares a common word."
+                "YES if at least two results look useful for the query's subject: same topic, "
+                "organisation, programme, funder, grant, competition, place, or person. "
+                "Official pages, news, listings, and aggregators about it count. "
+                "Partial matches and synonyms count. "
+                "NO only if the list is empty, a captcha or block page, generic shopping, "
+                "or clearly about something unrelated that only shares a common word."
             ),
         },
         {
@@ -737,29 +739,6 @@ async def run_search(
             _search_log.warning("search engine %s failed for %r", name, narrowed, exc_info=True)
             return None, "error"
 
-    names = engine_names()
-    tasks = [asyncio.create_task(search_engine(name)) for name in names]
-    gather = asyncio.gather(*tasks)
-    try:
-        budget = max(0.0, float(os.environ.get("SEARCH_FREE_BUDGET_S", "12")))
-    except ValueError:
-        budget = 12.0
-    try:
-        await asyncio.wait_for(asyncio.shield(gather), timeout=budget)
-    except asyncio.TimeoutError:
-        # Preserve completed engines and cancel only work still pending.
-        _, pending = await asyncio.wait(tasks, timeout=0)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        if not gather.done():
-            gather.cancel()
-        try:
-            await gather
-        except asyncio.CancelledError:
-            pass
-
     def record(name, result):
         hits, reason = result
         if reason:
@@ -770,10 +749,67 @@ async def run_search(
             used.append(name)
             groups.append(hits)
 
-    for name, task in zip(names, tasks):
-        record(name, (None, "error") if task.cancelled() else task.result())
+    names = engine_names()
+    tasks = {name: asyncio.create_task(search_engine(name)) for name in names}
+    try:
+        budget = max(0.0, float(os.environ.get("SEARCH_FREE_BUDGET_S", "12")))
+    except ValueError:
+        budget = 12.0
+    try:
+        apify_min_free_hits = max(1, int(os.environ.get("SEARCH_APIFY_MIN_FREE_HITS", "3")))
+    except ValueError:
+        apify_min_free_hits = 3
+    try:
+        early_grace_s = max(0.0, float(os.environ.get("SEARCH_EARLY_GRACE_S", "1.5")))
+    except ValueError:
+        early_grace_s = 1.5
+    free_hits_target = min(limit, apify_min_free_hits)
 
-    if fallback and apify_token and len(merge_hits(groups, limit)) < limit:
+    # Finish as soon as enough relevant hits are in, instead of waiting out the
+    # whole free budget for engines that are blocked or just slow. Results are
+    # recorded in engine order below, not completion order.
+    pending = set(tasks.values())
+    results: Dict[asyncio.Task, Any] = {}
+    early_deadline = None
+    while pending:
+        remaining = budget - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        if early_deadline is not None:
+            timeout = min(remaining, max(0.0, early_deadline - time.monotonic()))
+            if timeout <= 0:
+                break
+        else:
+            timeout = remaining
+        done, pending = await asyncio.wait(pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            results[task] = task.result()
+        if not pending:
+            break
+        if early_deadline is None:
+            ready = [
+                results[tasks[name]][0]
+                for name in names
+                if tasks[name] in results and results[tasks[name]][1] is None
+            ]
+            if len(merge_hits(ready, free_hits_target)) >= free_hits_target:
+                grace = min(early_grace_s, max(0.0, budget - (time.monotonic() - start)))
+                early_deadline = time.monotonic() + grace
+
+    pending_reason = "early" if early_deadline is not None else "error"
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    for name in names:
+        task = tasks[name]
+        if task in results:
+            record(name, results[task])
+        else:
+            skipped.append({"engine": name, "reason": pending_reason})
+
+    if fallback and apify_token and len(merge_hits(groups, limit)) < free_hits_target:
         try:
             apify_min_s = max(0.0, float(os.environ.get("SEARCH_APIFY_MIN_S", "5")))
         except ValueError:
