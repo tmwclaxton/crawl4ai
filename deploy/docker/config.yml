@@ -22,7 +22,12 @@ llm:
 # Default: 3600 (1 hour). Set to 0 to disable TTL (not recommended).
 # Can be overridden with REDIS_TASK_TTL environment variable.
 redis:
-  host: "localhost"
+  # Service name on the compose network. Do not set this to "redis": this
+  # container is attached to more than one Docker network, and another stack
+  # also answers to that short name, so jobs land in the wrong instance.
+  # entrypoint.sh falls back to 127.0.0.1 when crawl4ai_redis does not resolve
+  # (the single-container image, whose Redis is loopback-only).
+  host: "crawl4ai_redis"
   port: 6379
   db: 0
   password: ""
@@ -37,7 +42,7 @@ redis:
 # (the pre-hardening behavior), so you can relax or disable each one.
 limits:
   max_body_bytes: 10485760  # 10 MiB request body cap (413 if exceeded); 0 = unbounded
-  max_pages: 100            # deep-crawl page budget clamp (defense in depth)
+  max_pages: 100            # deep-crawl page budget clamp (deep crawl needs CRAWL4AI_ALLOW_DEEP_CRAWL=true); 0 = no limit
   max_depth: 5              # deep-crawl depth clamp
   wall_clock_s: 300         # per-crawl deadline in seconds (504 on timeout); 0 = no deadline
   queue:                    # background job queue for /crawl/job and /llm/job
@@ -48,9 +53,12 @@ limits:
 # Rate Limiting Configuration
 rate_limiting:
   enabled: True
+  # Per token (see server.rate_limit_key), not per IP. 1000/minute is the
+  # operator ceiling so GrantGunner is not throttled. JWT subjects are also
+  # capped at CRAWL4AI_TOKEN_RATE_PER_MINUTE (default 60) by TokenRateLimitMiddleware.
   default_limit: "1000/minute"
   trusted_proxies: []
-  storage_uri: "memory://"  # Use "redis://localhost:6379" for production
+  storage_uri: "memory://"  # Use "redis://crawl4ai_redis:6379" for production
 
 # Security Configuration
 # WARNING: For production deployments, enable security and use proper SECRET_KEY:
@@ -61,8 +69,17 @@ security:
   enabled: true
   jwt_enabled: false
   api_token: ""  # When set, /token endpoint requires this secret to issue JWTs
+  # TLS is terminated at the edge proxy. Redirecting inside the container
+  # would break the loopback healthcheck, which is plain HTTP.
   https_redirect: false
-  trusted_hosts: ["*"]
+  # Host header allow-list. testserver is the in-process test client.
+  # crawl4ai is the compose service name for calls that do not use the public host.
+  trusted_hosts:
+    - "crawl4ai.grantgunner.org"
+    - "crawl4ai"
+    - "localhost"
+    - "127.0.0.1"
+    - "testserver"
   cors_allow_origins: []  # deny-by-default; list explicit origins to allow CORS
   headers:
     x_content_type_options: "nosniff"

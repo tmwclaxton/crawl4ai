@@ -1,9 +1,15 @@
 FROM python:3.12-slim-bookworm AS build
 
 # C4ai version
-ARG C4AI_VER=0.9.4
+ARG C4AI_VER=0.9.5
 ENV C4AI_VERSION=$C4AI_VER
 LABEL c4ai.version=$C4AI_VER
+
+# Git commit baked into the image so /health can show deploy drift.
+# Pass --build-arg GIT_SHA=$(git rev-parse HEAD). "unknown" means unlabeled.
+ARG GIT_SHA=unknown
+ENV CRAWL4AI_GIT_SHA=$GIT_SHA
+LABEL org.opencontainers.image.revision=$GIT_SHA
 
 # Set build arguments
 ARG APP_HOME=/app
@@ -19,7 +25,6 @@ ENV PYTHONFAULTHANDLER=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
     DEBIAN_FRONTEND=noninteractive \
-    REDIS_HOST=localhost \
     REDIS_PORT=6379
 
 ARG PYTHON_VERSION=3.12

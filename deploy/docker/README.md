@@ -562,7 +562,62 @@ Crucially, when sending configurations directly via JSON, they **must** follow t
 ```
 
 **LLM Extraction Strategy** *(Keep example, ensure schema uses type/value wrapper)*
-*(Keep Deep Crawler Example)*
+#### Deep Crawling (opt-in)
+
+Deep crawling over the API is **disabled by default**: a request with
+`deep_crawl_strategy` returns HTTP 400. To allow it, start the container with
+`CRAWL4AI_ALLOW_DEEP_CRAWL=true`:
+
+```bash
+docker run -d \
+  -p 11235:11235 \
+  --name crawl4ai \
+  --shm-size=1g \
+  -e CRAWL4AI_API_TOKEN="$CRAWL4AI_API_TOKEN" \
+  -e CRAWL4AI_ALLOW_DEEP_CRAWL=true \
+  unclecode/crawl4ai:latest
+```
+
+With Docker Compose, put `CRAWL4AI_ALLOW_DEEP_CRAWL=true` in the `.env` file in
+the project root, or export it in your shell. The compose file sets this
+variable itself, so a value in `.llm.env` is ignored.
+
+```json
+{
+  "urls": ["https://docs.crawl4ai.com"],
+  "crawler_config": {
+    "type": "CrawlerRunConfig",
+    "params": {
+      "deep_crawl_strategy": {
+        "type": "BFSDeepCrawlStrategy",
+        "params": {
+          "max_depth": 2,
+          "max_pages": 20,
+          "filter_chain": {
+            "type": "FilterChain",
+            "params": {
+              "filters": [
+                {"type": "URLPatternFilter", "params": {"patterns": ["*/core/*"]}},
+                {"type": "DomainFilter", "params": {"allowed_domains": ["docs.crawl4ai.com"]}}
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Rules the server applies:
+
+- **One start URL** per request, and not inside `crawler_configs`.
+- `max_pages` and `max_depth` are clamped to `limits.max_pages` and `limits.max_depth` in `config.yml` (default 100 and 5; `max_pages: 0` means no limit). The crawl stops after `limits.wall_clock_s`, also on `/crawl/stream`.
+- **Allowed types:** `BFSDeepCrawlStrategy`, `DFSDeepCrawlStrategy`, `BestFirstCrawlingStrategy`; `FilterChain` with `URLPatternFilter`, `DomainFilter`, `ContentTypeFilter`; scorers `KeywordRelevanceScorer`, `CompositeScorer`, `DomainAuthorityScorer`, `FreshnessScorer`, `PathDepthScorer`. `SEOFilter` and `ContentRelevanceFilter` are refused (they fetch pages outside the egress controls).
+- `URLPatternFilter` accepts globs that start with `*` (`*/blog/*`), `/prefix/*` or `*.ext`. Regex patterns are refused.
+- `resume_state` is refused, and so is `fetch_ssl_certificate` together with a deep crawl. Lists (patterns, keywords, filters, scorers) are limited to 100 items. One strategy may have at most 20 filters and scorers and 200 list items in total, and a `CompositeScorer` cannot contain another `CompositeScorer`. Discovered links longer than 2048 characters are skipped.
+
+Turn the flag on only when you accept that one request can fetch many pages.
 
 ### REST API Examples
 
@@ -657,6 +712,29 @@ async def test_stream_crawl(token: str = None): # Made token optional
 # import asyncio
 # asyncio.run(test_stream_crawl())
 ```
+
+#### Per-URL Configs (`crawler_configs`)
+
+To crawl different URLs with different settings in one request, send `crawler_configs`: a list of `CrawlerRunConfig` payloads, each with a `url_matcher`. Every URL uses the first entry whose `url_matcher` matches it, and an entry without a `url_matcher` matches every URL.
+
+```python
+payload = {
+    "urls": ["https://docs.example.com/guide", "https://example.com/"],
+    "crawler_configs": [
+        {
+            "type": "CrawlerRunConfig",
+            "params": {"url_matcher": "*docs.example.com*", "css_selector": "main"},
+        },
+        # Catch-all: decides every URL the entries above did not match
+        {"type": "CrawlerRunConfig", "params": {"url_matcher": "*"}},
+    ],
+}
+```
+
+- The list is used for one URL or many, on both `/crawl` and `/crawl/stream`.
+- When a list is sent, `crawler_config` is ignored. It is not a fallback: a URL that no entry matches comes back as a failed result (`No matching configuration found for URL: ...`), so end the list with a catch-all entry (`"url_matcher": "*"`).
+- The server's `crawler.base_config` defaults from `config.yml` are applied to each entry on both endpoints.
+- A list that mixes `PDFContentScrapingStrategy` entries with other scraping strategies is refused with `400`, because one crawler serves every URL of a request.
 
 ### Asynchronous Jobs with Webhooks
 
@@ -892,9 +970,13 @@ llm:
   provider: "openai/gpt-4o-mini"  # Can be overridden by LLM_PROVIDER env var
   # api_key: sk-...  # If you pass the API key directly (not recommended)
 
-# Redis Configuration (Used by internal Redis server managed by supervisord)
+# Redis Configuration.
+# Use the compose service name. The bare hostname "redis" is ambiguous when
+# this container shares a Docker network with another stack that also has a
+# service called redis. entrypoint.sh falls back to 127.0.0.1 when
+# crawl4ai_redis does not resolve (single-container image, bundled Redis).
 redis:
-  host: "localhost"
+  host: "crawl4ai_redis"
   port: 6379
   db: 0
   password: ""
@@ -941,6 +1023,8 @@ observability:
   health_check:
     endpoint: "/health"
 ```
+
+`docker-compose.yml` runs Redis as the service `crawl4ai_redis`. The port is not published. Set `REDIS_PASSWORD` before a production `docker compose up` (the compose default is only for a local boot) and do not add a network alias named `redis`. Pass `--build-arg GIT_SHA=$(git rev-parse HEAD)` (or export `GIT_SHA` before `docker compose build`) so `/health` reports `git_sha` and deploy drift is visible. The edge proxy in front of this API is not part of this compose file; `deploy/docker/nginx-edge.conf` is the timeout and body-size snippet for that proxy (`proxy_read_timeout 330s`, `client_max_body_size 10m`).
 
 *(JWT Authentication section remains the same, just note the default port is now 11235 for requests)*
 

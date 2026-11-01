@@ -2,8 +2,8 @@
 
 Both are off unless the operator turns them on, except the page-timeout cap
 and the same-domain pause, which default to the faster GrantGunner settings.
-Set CRAWL4AI_PAGE_TIMEOUT_MS=60000 or CRAWL4AI_DISABLE_RATE_LIMITER=false
-to restore the upstream behavior.
+Set CRAWL4AI_PAGE_TIMEOUT_MS=60000 to restore the upstream page timeout.
+The same-host crawl pause is on unless CRAWL4AI_DISABLE_RATE_LIMITER=true.
 
 Firecrawl runs only after the local crawl has already failed or returned no
 markdown. A normal page still comes from the browser and does not spend a
@@ -50,8 +50,13 @@ def page_timeout_cap_ms() -> int:
 
 
 def rate_limiter_disabled() -> bool:
-    """Skip the 1-2s pause between pages on the same host."""
-    return _flag("CRAWL4AI_DISABLE_RATE_LIMITER", "true") in _TRUE
+    """Skip the 1-2s pause between pages on the same host.
+
+    Off by default. A public token must not be able to turn the pause off
+    just by omitting the env var. Set CRAWL4AI_DISABLE_RATE_LIMITER=true
+    only for a private batch that does not spend paid fallbacks.
+    """
+    return _flag("CRAWL4AI_DISABLE_RATE_LIMITER", "false") in _TRUE
 
 
 def firecrawl_fallback_enabled() -> bool:
@@ -155,6 +160,10 @@ async def fill_failed_results(
             continue
         url = result.get("url")
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        import usage_log
+        if not await usage_log.allow_paid("firecrawl"):
+            logger.warning("Firecrawl daily cap spent; leaving %s unchanged", url)
             continue
         try:
             markdown = await scrape(url)

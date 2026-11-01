@@ -54,9 +54,9 @@ def pool_mock(api, monkeypatch):
     pooled.active_requests = 1  # release_crawler decrements this int
     mock = AsyncMock(return_value=pooled)
     monkeypatch.setattr(crawler_pool, "get_crawler", mock)
-    monkeypatch.setattr(api, "_normalize_and_validate_seeds", lambda urls: urls)
+    monkeypatch.setattr(api, "_normalize_and_validate_seeds", lambda urls: (urls, []))
     monkeypatch.setattr(egress_broker, "enforce_egress", lambda _: None)
-    monkeypatch.setattr(governor, "clamp_deep_crawl", lambda _: None)
+    monkeypatch.setattr(governor, "clamp_deep_crawl", lambda *args, **kwargs: None)
     return mock
 
 
@@ -129,37 +129,67 @@ async def test_default_strategy_still_uses_pool(api, pool_mock):
 
 
 @pytest.mark.asyncio
-async def test_per_url_pdf_strategy_gets_validator(api, pool_mock):
-    """SSRF: a PDF strategy sent per-URL via crawler_configs must be vetted too.
+async def test_mixed_pdf_and_browser_list_is_refused(api, pool_mock):
+    """One crawler cannot serve a PDF download and a browser page together.
 
-    crawler_configs is a public per-URL field on /crawl, and the handler builds
-    that config list on a separate branch from the top-level config. Wiring
-    url_validator only on the top-level branch leaves the per-URL one doing an
-    unvalidated download of whatever the request names.
+    Refusing the mix also closes the path where a per-URL PDF entry could
+    skip the SSRF validator by riding along with a browser config.
     """
+    from fastapi import HTTPException
+
     pdf_config = _crawler_config_payload(with_pdf_strategy=True)
     plain_config = _crawler_config_payload(with_pdf_strategy=False)
 
+    with pytest.raises(HTTPException) as exc_info:
+        await api.handle_crawl_request(
+            urls=["https://example.com/document.pdf", "https://example.com/page.html"],
+            browser_config={"type": "BrowserConfig", "params": {}},
+            crawler_config=plain_config,
+            crawler_configs=[pdf_config, plain_config],
+            config=CONFIG,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "PDFContentScrapingStrategy" in exc_info.value.detail
+    pool_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_per_url_pdf_strategy_gets_validator(api, pool_mock, monkeypatch):
+    """SSRF: every PDF strategy in crawler_configs gets the download validator.
+
+    crawler_configs is a public per-URL field. Wiring url_validator only on
+    the top-level config would leave the list doing an unvalidated download.
+    """
+    used = {}
+    real_crawler_cls = api.AsyncWebCrawler
+
+    def spy_crawler(*args, **kwargs):
+        crawler = real_crawler_cls(*args, **kwargs)
+        used["crawler"] = crawler
+        crawler.arun_many = AsyncMock(return_value=[])
+        crawler.close = AsyncMock(wraps=crawler.close)
+        return crawler
+
+    monkeypatch.setattr(api, "AsyncWebCrawler", spy_crawler)
+    pdf_config = _crawler_config_payload(with_pdf_strategy=True)
+
     response = await api.handle_crawl_request(
-        # The config list branch only engages with more than one URL.
-        urls=["https://example.com/document.pdf", "https://example.com/page.html"],
+        urls=["https://example.com/a.pdf", "https://example.com/b.pdf"],
         browser_config={"type": "BrowserConfig", "params": {}},
-        crawler_config=plain_config,  # top-level is clean; the PDF rides per-URL
-        crawler_configs=[pdf_config, plain_config],
+        crawler_config=pdf_config,
+        crawler_configs=[pdf_config, pdf_config],
         config=CONFIG,
     )
 
     assert response["success"] is True
-    configs = pool_mock.return_value.arun_many.await_args.kwargs["config"]
-    pdf_strategies = [
-        cfg.scraping_strategy for cfg in configs
-        if isinstance(cfg.scraping_strategy, PDFContentScrapingStrategy)
-    ]
-    # Guard the guard: if deserialization ever drops the strategy, the loop
-    # below would pass vacuously and the test would protect nothing.
-    assert len(pdf_strategies) == 1
-    for strategy in pdf_strategies:
-        assert strategy.url_validator is api.validate_url_destination
+    configs = used["crawler"].arun_many.await_args.kwargs["config"]
+    assert len(configs) == 2
+    for cfg in configs:
+        assert isinstance(cfg.scraping_strategy, PDFContentScrapingStrategy)
+        assert cfg.scraping_strategy.url_validator is api.validate_url_destination
+    pool_mock.assert_not_awaited()
+    used["crawler"].close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

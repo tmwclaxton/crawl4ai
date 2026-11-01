@@ -102,6 +102,8 @@ EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lowe
 # an unprivileged user namespace (unprivileged_userns_clone=1) or a seccomp
 # profile, set CRAWL4AI_CHROMIUM_SANDBOX=true to drop --no-sandbox and run the
 # renderer sandboxed. Verify Chromium still starts after flipping it.
+# crawl4ai.browser_manager reads the same variable at launch, so the sandbox
+# also applies to browsers built from a request body, not only this config.
 CHROMIUM_SANDBOX = os.environ.get("CRAWL4AI_CHROMIUM_SANDBOX", "false").lower() == "true"
 
 # Warn loudly if API token is not set (all endpoints unauthenticated)
@@ -363,8 +365,25 @@ async def monitor_ui_redirect():
 # ─────────────────── infra / middleware  ─────────────────────
 redis = aioredis.from_url(_build_redis_url(config))
 
+def rate_limit_key(request: Request) -> str:
+    """Bucket by token, not by client IP.
+
+    The public edge fronts every caller with one address, so an IP bucket
+    either shares one limit across GrantGunner and every MCP user, or lets a
+    leaked token spend at the full IP rate. The operator API token and each
+    JWT subject get their own bucket.
+    """
+    principal = getattr(request.state, "principal", None)
+    if isinstance(principal, dict):
+        sub = principal.get("sub") or principal.get("email")
+        if sub:
+            via = principal.get("via") or "jwt"
+            return f"{via}:{sub}"
+    return get_remote_address(request)
+
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=rate_limit_key,
     default_limits=[config["rate_limiting"]["default_limit"]],
     storage_uri=_build_rate_limit_storage_uri(config),
 )
@@ -464,6 +483,82 @@ def _current_api_token() -> str:
 
 
 from mcp_oauth import OAUTH_PUBLIC_PATHS, OAUTH_PUBLIC_PREFIXES, attach_oauth
+
+# Added before AuthGate so it runs after auth has attached the principal.
+# Non-operator tokens get a tighter per-minute cap than the SlowAPI default,
+# which stays high enough for the GrantGunner operator token.
+_TOKEN_RATE_WINDOW_S = 60
+_token_hits: Dict[str, list] = {}
+
+
+def _token_rate_limit(principal: Optional[Dict]) -> int:
+    raw = os.environ.get("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "60")
+    try:
+        other = int(raw)
+    except ValueError:
+        other = 60
+    if isinstance(principal, dict) and principal.get("via") == "api_token":
+        op = os.environ.get("CRAWL4AI_OPERATOR_RATE_PER_MINUTE", "1200")
+        try:
+            return max(int(op), 1)
+        except ValueError:
+            return 1200
+    return max(other, 1)
+
+
+class TokenRateLimitMiddleware:
+    """Per-token request cap for JWT callers. The operator token keeps a
+    higher ceiling so the GrantGunner app is not throttled with MCP users."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        import usage_log
+        usage_log.current_client.set("anonymous")
+        if path in {HEALTH_PATH, "/token", "/", "/monitor"} or path.startswith(
+            ("/dashboard", "/playground", "/static", "/oauth", "/.well-known")
+        ):
+            await self.app(scope, receive, send)
+            return
+        state = scope.get("state") or {}
+        principal = state.get("principal") if isinstance(state, dict) else None
+        if not isinstance(principal, dict) or principal.get("via") == "api_token":
+            # Unauthenticated (already rejected by the gate) and the operator
+            # token use the SlowAPI limit only.
+            if isinstance(principal, dict):
+                usage_log.current_client.set(f"api_token:{principal.get('sub') or 'operator'}")
+            await self.app(scope, receive, send)
+            return
+        sub = str(principal.get("sub") or principal.get("email") or "jwt")
+        usage_log.current_client.set(f"jwt:{sub}")
+        limit = _token_rate_limit(principal)
+        now = time.time()
+        bucket = _token_hits.setdefault(sub, [])
+        cutoff = now - _TOKEN_RATE_WINDOW_S
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+        if len(bucket) >= limit:
+            body = b'{"detail":"Rate limit exceeded for this token"}'
+            await send({
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        bucket.append(now)
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(TokenRateLimitMiddleware)
 
 app.add_middleware(
     AuthGateMiddleware,
@@ -933,8 +1028,8 @@ async def execute_js(
             html: str
             success: bool
             cleaned_html: Optional[str] = None
-            media: Dict[str, List[Dict]] = {}
-            links: Dict[str, List[Dict]] = {}
+            media: Dict[str, List[Dict]] = {"images": [], "videos": [], "audios": []}
+            links: Dict[str, List[Dict]] = {"internal": [], "external": []}
             downloaded_files: Optional[List[str]] = None
             js_execution_result: Optional[Dict[str, Any]] = None
             screenshot: Optional[str] = None
@@ -1035,7 +1130,14 @@ async def get_hooks_info():
 
 @app.get(config["observability"]["health_check"]["endpoint"])
 async def health():
-    return {"status": "ok", "timestamp": time.time(), "version": __version__}
+    # CRAWL4AI_GIT_SHA is baked into the image at build time. "unknown" means
+    # the image was built without the label, which is itself deploy drift.
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "version": __version__,
+        "git_sha": os.environ.get("CRAWL4AI_GIT_SHA", "unknown"),
+    }
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])
@@ -1173,6 +1275,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         config=config,
         hooks_config=hooks_config,
         **({"site_profile": crawl_request.site_profile} if crawl_request.site_profile is not None else {}),
+        crawler_configs=crawl_request.crawler_configs,
     )
     
     # Add hooks info to response headers if available

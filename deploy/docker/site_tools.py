@@ -68,6 +68,31 @@ def ensure_http_url(url: str) -> str:
     return value
 
 
+def ensure_public_url(url: str) -> str:
+    """Reject internal, link-local, and Docker-DNS targets before a fetch.
+
+    resolve_and_pin checks every DNS answer and pins one global IP. Callers
+    that dial through the egress proxy use that pin, so a later rebinding
+    lookup is not what gets connected. Redirect hops are separate requests
+    and must call this again.
+    """
+    value = ensure_http_url(url)
+    from egress_broker import EgressBlocked, resolve_and_pin
+
+    try:
+        resolve_and_pin(value)
+    except EgressBlocked as exc:
+        raise ToolError(400, "URL blocked (SSRF protection)") from exc
+    return value
+
+
+def _public_or_none(url: str) -> Optional[str]:
+    try:
+        return ensure_public_url(url)
+    except ToolError:
+        return None
+
+
 def path_allowed(url: str, include_paths: Sequence[str], exclude_paths: Sequence[str]) -> bool:
     path = urlparse(url).path or "/"
     if not path.startswith("/"):
@@ -417,7 +442,7 @@ async def run_scrape(
         raise ToolError(400, f"At most {SCRAPE_URL_CAP} URLs")
     pages = []
     for url in urls:
-        ensure_http_url(url)
+        url = ensure_public_url(url)
         page = await fetch(
             url,
             only_main=only_main_content,
@@ -466,7 +491,7 @@ async def run_map(
     include_subdomains: bool,
     seeder: Any,
 ) -> Dict[str, Any]:
-    ensure_http_url(url)
+    url = ensure_public_url(url)
     source = seed_source(sitemap)
     config = type("SeedConfig", (), {})()
     config.source = source
@@ -496,6 +521,7 @@ async def run_map(
             items.append(entry)
     if search:
         items = rank_mapped(items, search)
+    items = [item for item in items if _public_or_none(item.get("url") or "")]
     items = filter_mapped(items, root=url, include_subdomains=include_subdomains, limit=limit)
     return {
         "success": True,
@@ -852,11 +878,14 @@ async def run_agent(
     if not prompt.strip():
         raise ToolError(400, "prompt is required")
     if urls:
-        chosen = [ensure_http_url(url) for url in list(urls)[:max_pages]]
+        chosen = [ensure_public_url(url) for url in list(urls)[:max_pages]]
     else:
         if discover is None:
             raise ToolError(400, "Provide urls or allow discovery")
-        chosen = [ensure_http_url(url) for url in list(await discover(prompt))[:max_pages]]
+        discovered = list(await discover(prompt))[:max_pages]
+        chosen = [item for item in (_public_or_none(url) for url in discovered) if item]
+        if not chosen:
+            raise ToolError(400, "No public URLs to read")
     pages = []
     for url in chosen:
         page = await scrape(url)

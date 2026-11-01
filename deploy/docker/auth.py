@@ -29,6 +29,10 @@ import jwt
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, EmailStr
 
+# 60 minutes, reviewed against the old 1440 minute tokens. A leaked JWT
+# should die within the hour. GrantGunner uses the static API token, so
+# shortening this does not drop that client. OAuth refresh is separate
+# and is capped in mcp_oauth.REFRESH_TTL_SECONDS.
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 ALGORITHM = "HS256"
 _ALGORITHMS = [ALGORITHM]  # a LIST on purpose: no substring matching, no alg:none

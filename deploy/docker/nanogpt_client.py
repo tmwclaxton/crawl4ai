@@ -47,6 +47,9 @@ async def complete(
     client: Optional[httpx.AsyncClient] = None,
 ) -> str:
     """One non-streaming chat completion. Returns the assistant text."""
+    import usage_log
+    if not await usage_log.allow_paid("nanogpt"):
+        raise NanoGPTError(429, "Daily NanoGPT cap for this token is spent")
     settings = nanogpt_settings()
     chosen = (model or settings["model"]).strip()
     if chosen.startswith("openai/"):
