@@ -72,8 +72,6 @@ DEFAULT_CONFIG = {
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-software-rasterizer",
-                "--allow-insecure-localhost",
-                "--ignore-certificate-errors",
             ],
         },
     },
@@ -138,6 +136,13 @@ def load_config() -> Dict:
         config["llm"]["api_key"] = llm_api_key
         logging.info("LLM API key loaded from LLM_API_KEY environment variable")
 
+    # CRAWL4AI_TRUSTED_HOSTS appends Host header names. The shipped list
+    # (public hostname, compose service name, loopback, testserver) always
+    # stays, so a partial env value cannot drop a caller that already works.
+    config["security"]["trusted_hosts"] = resolve_trusted_hosts(
+        config["security"].get("trusted_hosts")
+    )
+
     # Override Redis task TTL from environment if set
     redis_task_ttl = os.environ.get("REDIS_TASK_TTL")
     if redis_task_ttl:
@@ -179,6 +184,23 @@ def setup_logging(config: Dict) -> None:
     crlf = CRLFSafeFilter()
     for handler in logging.getLogger().handlers:
         handler.addFilter(crlf)
+
+def resolve_trusted_hosts(configured: Optional[list] = None) -> list:
+    """Host allow-list: shipped names, plus CRAWL4AI_TRUSTED_HOSTS extras.
+
+    Extras are comma-separated (other internal DNS names, extra public
+    hostnames). They are appended. Duplicates are dropped. An empty env
+    var leaves the configured list unchanged.
+    """
+    defaults = [str(host).strip() for host in (configured or []) if str(host).strip()]
+    raw = os.environ.get("CRAWL4AI_TRUSTED_HOSTS", "")
+    extras = [part.strip() for part in raw.split(",") if part.strip()]
+    seen = []
+    for host in defaults + extras:
+        if host not in seen:
+            seen.append(host)
+    return seen
+
 
 def get_base_url(request: Request) -> str:
     """Get base URL including scheme and host."""

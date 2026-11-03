@@ -60,6 +60,34 @@ def get_pool_snapshot() -> dict:
     }
 
 
+def _browser_connected(crawler: AsyncWebCrawler) -> bool:
+    """False when the Playwright browser has died and would be a zombie slot.
+
+    A disconnected browser still occupies the pool. The next request would
+    keep using it and fail, and the Chromium process (if any) is never reaped
+    until the weekly restart. Treat that slot as empty.
+    """
+    try:
+        browser = crawler.crawler_strategy.browser_manager.browser
+        if browser is None:
+            return False
+        is_connected = getattr(browser, "is_connected", None)
+        if callable(is_connected):
+            return bool(is_connected())
+        return True
+    except Exception:
+        return False
+
+
+async def _drop_crawler(pool: Dict[str, AsyncWebCrawler], sig: str) -> None:
+    crawler = pool.pop(sig, None)
+    LAST_USED.pop(sig, None)
+    USAGE_COUNT.pop(sig, None)
+    if crawler is not None:
+        with suppress(Exception):
+            await crawler.close()
+
+
 def _sig(cfg: BrowserConfig) -> str:
     """Generate config signature."""
     payload = json.dumps(cfg.to_dict(), sort_keys=True, separators=(",",":"))
@@ -71,9 +99,16 @@ def _is_default_config(sig: str) -> bool:
 
 async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Get crawler from pool with tiered strategy."""
+    global PERMANENT
     sig = _sig(_apply_pool_defaults(cfg))
     async with LOCK:
         # Check permanent browser for default config
+        if PERMANENT and _is_default_config(sig) and not _browser_connected(PERMANENT):
+            if getattr(PERMANENT, "active_requests", 0) == 0:
+                logger.warning("Permanent browser is disconnected; replacing it")
+                with suppress(Exception):
+                    await PERMANENT.close()
+                PERMANENT = None
         if PERMANENT and _is_default_config(sig):
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
@@ -84,6 +119,10 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             return PERMANENT
 
         # Check hot pool
+        if sig in HOT_POOL and not _browser_connected(HOT_POOL[sig]):
+            if getattr(HOT_POOL[sig], "active_requests", 0) == 0:
+                logger.warning(f"Hot browser disconnected (sig={sig[:8]}); replacing it")
+                await _drop_crawler(HOT_POOL, sig)
         if sig in HOT_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1
@@ -95,6 +134,10 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             return crawler
 
         # Check cold pool (promote to hot if used 3+ times)
+        if sig in COLD_POOL and not _browser_connected(COLD_POOL[sig]):
+            if getattr(COLD_POOL[sig], "active_requests", 0) == 0:
+                logger.warning(f"Cold browser disconnected (sig={sig[:8]}); replacing it")
+                await _drop_crawler(COLD_POOL, sig)
         if sig in COLD_POOL:
             LAST_USED[sig] = time.time()
             USAGE_COUNT[sig] = USAGE_COUNT.get(sig, 0) + 1

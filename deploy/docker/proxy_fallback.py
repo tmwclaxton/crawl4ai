@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -36,6 +37,68 @@ def proxy_fallback_enabled() -> bool:
     if _flag("CRAWL4AI_PROXY_FALLBACK", "true") not in _TRUE:
         return False
     return bool(configured_tiers())
+
+
+# Hosts that recently returned a Cloudflare challenge. The next crawl of
+# that host skips the local browser and goes straight to the proxy tiers.
+_CLOUDFLARE_TTL_S = 30 * 60
+_cloudflare_until: dict = {}
+
+
+def remember_cloudflare(url: str) -> None:
+    host = (urlparse(url).hostname or "").lower()
+    if host:
+        _cloudflare_until[host] = time.time() + _CLOUDFLARE_TTL_S
+
+
+def cloudflare_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return bool(host) and _cloudflare_until.get(host, 0) > time.time()
+
+
+def partition_cloudflare_hosts(urls: List[str]) -> Tuple[List[str], List[str]]:
+    """Split URLs into (crawl locally, skip straight to the proxy)."""
+    local, proxied = [], []
+    for url in urls:
+        if cloudflare_host(url):
+            proxied.append(url)
+        else:
+            local.append(url)
+    return local, proxied
+
+
+def cloudflare_placeholders(urls: List[str]) -> list:
+    """Failed results so fill_failed_with_proxy sends these straight to DataImpulse."""
+    return [
+        {
+            "url": url,
+            "success": False,
+            "html": "",
+            "error_message": "Cloudflare block cached; skipping the local browser",
+        }
+        for url in urls
+    ]
+
+
+def mark_cloudflare_results(results: list) -> list:
+    """A Cloudflare challenge page is not a successful crawl. Remember the host
+    and let the proxy fallback take it."""
+    try:
+        from crawl4ai.antibot_detector import is_blocked
+    except Exception:
+        return results
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        html = result.get("html") or ""
+        blocked, reason = is_blocked(result.get("status_code"), html, result.get("error_message"))
+        if blocked and "Cloudflare" in (reason or ""):
+            url = result.get("url")
+            if isinstance(url, str):
+                remember_cloudflare(url)
+            result["success"] = False
+            result["error_message"] = reason
+    return results
 
 
 def skip_paid_proxy(url: str) -> bool:
@@ -96,6 +159,10 @@ async def fill_failed_with_proxy(
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             continue
         if skip_paid_proxy(url):
+            continue
+        import usage_log
+        if not await usage_log.allow_paid("proxy"):
+            logger.warning("DataImpulse daily cap spent; leaving %s unchanged", url)
             continue
         for name, proxy_url in tiers:
             recovered = None

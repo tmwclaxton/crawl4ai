@@ -37,8 +37,10 @@ def test_page_timeout_env_can_restore_60s(monkeypatch):
     assert cfg.page_timeout == 60_000
 
 
-def test_rate_limiter_is_off_unless_restored(monkeypatch):
+def test_rate_limiter_is_on_unless_explicitly_disabled(monkeypatch):
     monkeypatch.delenv("CRAWL4AI_DISABLE_RATE_LIMITER", raising=False)
+    assert rate_limiter_disabled() is False
+    monkeypatch.setenv("CRAWL4AI_DISABLE_RATE_LIMITER", "true")
     assert rate_limiter_disabled() is True
     monkeypatch.setenv("CRAWL4AI_DISABLE_RATE_LIMITER", "false")
     assert rate_limiter_disabled() is False

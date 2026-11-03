@@ -93,7 +93,7 @@ def _browser_seen_by_pool(monkeypatch, **kwargs):
         raise RuntimeError("stop before launching a browser")
 
     monkeypatch.setattr(crawler_pool, "get_crawler", fake_get_crawler)
-    monkeypatch.setattr(api, "_normalize_and_validate_seeds", lambda urls: urls)
+    monkeypatch.setattr(api, "_normalize_and_validate_seeds", lambda urls: (urls, []))
     with pytest.raises(Exception):
         asyncio.run(api.handle_crawl_request(urls=["https://www.youtube.com/@a"], browser_config={}, crawler_config={}, config=api_config(), **kwargs))
     return seen["cfg"]

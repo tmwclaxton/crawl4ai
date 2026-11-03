@@ -56,15 +56,39 @@ async def _search_fetch(
     headers: Dict[str, str],
     payload: Optional[Dict[str, Any]] = None,
 ):
+    """Fetch a search engine URL. Each redirect is checked again so an engine
+    cannot bounce the server onto an internal host. When the pinning proxy is
+    up, the dial uses the pinned IP (DNS rebinding)."""
     import httpx
+    from urllib.parse import urljoin
+
+    from crawl4ai.egress_policy import proxy_url
+    from egress_broker import EgressBlocked, resolve_and_pin
 
     timeout = 60 if payload is not None else 8
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        if payload is None:
-            response = await client.get(url, headers=headers)
-        else:
-            response = await client.post(url, headers=headers, json=payload)
-        return response.status_code, response.text
+    body = payload
+    current = url
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, proxy=proxy_url(),
+    ) as client:
+        for _ in range(5):
+            try:
+                resolve_and_pin(current)
+            except EgressBlocked:
+                return 400, ""
+            if body is None:
+                response = await client.get(current, headers=headers)
+            else:
+                response = await client.post(current, headers=headers, json=body)
+                body = None
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    return response.status_code, response.text
+                current = urljoin(current, location)
+                continue
+            return response.status_code, response.text
+    return 400, ""
 
 
 async def _complete(messages: List[Dict[str, str]]) -> str:
@@ -220,9 +244,9 @@ async def _site_crawl(
     from crawl4ai.deep_crawling.filters import URLFilter, FilterChain
     from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
     from crawler_pool import get_crawler, release_crawler
-    from site_tools import clamp_crawl, ensure_http_url
+    from site_tools import clamp_crawl, ensure_public_url
 
-    root = ensure_http_url(url)
+    root = ensure_public_url(url)
     page_limit, depth = clamp_crawl(limit, max_depth, max_pages=max_pages, max_depth_cap=max_depth_cap)
 
     class PathRuleFilter(URLFilter):

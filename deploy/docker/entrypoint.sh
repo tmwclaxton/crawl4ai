@@ -6,14 +6,46 @@
 set -euo pipefail
 
 # --- Redis password: prefer a mounted secret, else an existing env var. ------
+# There is no public default. An external Redis (compose service
+# crawl4ai_redis) must be given REDIS_PASSWORD explicitly, below, after the
+# host is known. The bundled loopback Redis still gets an ephemeral password
+# when the operator did not set one.
 if [[ -z "${REDIS_PASSWORD:-}" && -f /run/secrets/redis_password ]]; then
     REDIS_PASSWORD="$(cat /run/secrets/redis_password)"
 fi
-if [[ -z "${REDIS_PASSWORD:-}" ]]; then
-    # Generate an ephemeral in-container password so redis is never open even
-    # if the operator forgot to mount one. (Loopback + requirepass.)
+
+# --- Redis host: never the bare name "redis" --------------------------------
+# config.yml uses crawl4ai_redis. On a shared Docker network the name "redis"
+# is ambiguous (this stack and another stack both answer to it). A single
+# container has no such service, so fall back to the bundled loopback Redis.
+REDIS_HOST="${REDIS_HOST:-}"
+if [[ -z "${REDIS_HOST}" ]]; then
+    REDIS_HOST="$(python3 -c 'import yaml; print((yaml.safe_load(open("config.yml")) or {}).get("redis", {}).get("host", "127.0.0.1"))')"
+fi
+if [[ "${REDIS_HOST}" == "redis" ]]; then
+    echo "entrypoint: refusing REDIS_HOST=redis. Use crawl4ai_redis, or 127.0.0.1 for the bundled Redis." >&2
+    exit 1
+fi
+if [[ "${REDIS_HOST}" != "127.0.0.1" && "${REDIS_HOST}" != "localhost" && "${REDIS_HOST}" != "::1" ]]; then
+    if ! getent hosts "${REDIS_HOST}" >/dev/null 2>&1; then
+        echo "entrypoint: Redis host ${REDIS_HOST} did not resolve; using bundled 127.0.0.1." >&2
+        REDIS_HOST="127.0.0.1"
+    fi
+fi
+export REDIS_HOST
+
+# External Redis must have an explicit password. Generating one here would
+# not match the passwordless production instance, and AUTH would fail with
+# a password the operator never set. Loopback keeps the ephemeral password
+# so the single-container image stays closed.
+if [[ "${REDIS_HOST}" != "127.0.0.1" && "${REDIS_HOST}" != "localhost" && "${REDIS_HOST}" != "::1" ]]; then
+    if [[ -z "${REDIS_PASSWORD:-}" ]]; then
+        echo "entrypoint: REDIS_PASSWORD is required when REDIS_HOST=${REDIS_HOST}. There is no default password. Set REDIS_PASSWORD to the password configured on that Redis (requirepass) and restart." >&2
+        exit 1
+    fi
+elif [[ -z "${REDIS_PASSWORD:-}" ]]; then
     REDIS_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-    echo "entrypoint: no REDIS_PASSWORD provided; generated an ephemeral one." >&2
+    echo "entrypoint: no REDIS_PASSWORD provided; generated an ephemeral one for the bundled Redis." >&2
 fi
 export REDIS_PASSWORD
 

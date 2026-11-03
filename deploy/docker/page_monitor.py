@@ -19,7 +19,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from site_tools import ToolError, ensure_http_url, normalize_snapshot
+import site_tools
+from site_tools import ToolError, normalize_snapshot
 
 logger = logging.getLogger("crawl4ai.page_monitor")
 
@@ -53,7 +54,8 @@ def webhook_static_error(url: str) -> Optional[str]:
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return "Webhook URL must have a hostname"
-    if host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
+    from egress_broker import host_is_denied
+    if host_is_denied(host) or host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
         return "Webhook URL must be a public host"
     try:
         address = ipaddress.ip_address(host)
@@ -103,7 +105,7 @@ class PageMonitor:
             raise ToolError(400, "At least one URL is required")
         if len(urls) > 20:
             raise ToolError(400, "At most 20 URLs")
-        checked = [ensure_http_url(url) for url in urls]
+        checked = [site_tools.ensure_public_url(url) for url in urls]
         interval = parse_schedule(schedule)
         if webhook:
             problem = webhook_static_error(webhook)
@@ -159,7 +161,12 @@ class PageMonitor:
         urls = json.loads(record["urls"])
         snapshots = json.loads(record.get("snapshots") or "{}")
         pages = []
-        for url in urls:
+        for raw_url in urls:
+            try:
+                url = site_tools.ensure_public_url(raw_url)
+            except ToolError as exc:
+                pages.append({"url": raw_url, "status": "error", "detail": exc.detail[:200]})
+                continue
             try:
                 current = await self.fetch(url)
             except Exception as exc:

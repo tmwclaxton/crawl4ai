@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import site_tools
 from doc_parse import ParseError, parse_document
 from page_monitor import PageMonitor, deliver_webhook, parse_schedule, webhook_static_error
 from site_tools import (
@@ -43,6 +44,13 @@ from site_tools import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "firecrawl_parity"
+
+
+@pytest.fixture(autouse=True)
+def _skip_live_dns_in_tool_unit_tests(monkeypatch):
+    """These tests fake the seeder and the fetcher. The SSRF check is covered
+    in test_security_audit_c.py so the unit tests stay offline."""
+    monkeypatch.setattr(site_tools, "ensure_public_url", site_tools.ensure_http_url)
 
 
 class MemoryRedis:

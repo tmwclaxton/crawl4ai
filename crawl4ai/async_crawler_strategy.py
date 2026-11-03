@@ -13,6 +13,7 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import hashlib
 import random
+import re
 import uuid
 from .js_snippet import load_js_script
 from .models import AsyncCrawlResponse
@@ -28,10 +29,46 @@ import aiofiles
 import aiohttp
 import chardet
 from aiohttp.client import ClientTimeout
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from types import MappingProxyType
 import contextlib
 from functools import partial
+
+def normalize_wait_for(wait_for, *, wait_for_images=False, screenshot=False):
+    """Drop image-only waits on text crawls and collapse duplicated selectors.
+
+    Production logs showed `Timeout waiting for selector 'img, img'`. That
+    selector is `img` listed twice. Waiting for an img element on a text
+    crawl (text_mode browsers, pages with no images, or a caller that passed
+    an image selector by habit) burns the page timeout. Image crawls, which
+    set wait_for_images or screenshot, still wait for a single `img`.
+    """
+    if not isinstance(wait_for, str):
+        return wait_for
+    raw = wait_for.strip()
+    if not raw:
+        return None
+    prefix = ""
+    body = raw
+    if raw.startswith("css:"):
+        prefix = "css:"
+        body = raw[4:].strip()
+    elif raw.startswith("js:"):
+        return raw
+    parts = []
+    for part in body.split(","):
+        part = part.strip()
+        if part and part not in parts:
+            parts.append(part)
+    if parts and all(part == "img" for part in parts):
+        if not wait_for_images and not screenshot:
+            return None
+        parts = ["img"]
+    if not parts:
+        return None
+    joined = ", ".join(parts)
+    return f"{prefix}{joined}" if prefix else joined
+
 
 class AsyncCrawlerStrategy(ABC):
     """
@@ -1015,6 +1052,12 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # --- Phase 2: Wait for page readiness ---
 
             if config.wait_for:
+                config.wait_for = normalize_wait_for(
+                    config.wait_for,
+                    wait_for_images=bool(getattr(config, "wait_for_images", False)),
+                    screenshot=bool(getattr(config, "screenshot", False)),
+                )
+            if config.wait_for:
                 try:
                     timeout = config.wait_for_timeout if config.wait_for_timeout is not None else config.page_timeout
                     await self.smart_wait(
@@ -1099,10 +1142,14 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
                     for selector in selectors:
                         try:
+                            # Passed as an argument, never pasted into the
+                            # script: a '"' in the selector used to end the
+                            # string literal and run the rest as JavaScript.
                             content = await self.adapter.evaluate(page,
-                                f"""Array.from(document.querySelectorAll("{selector}"))
+                                """(sel) => Array.from(document.querySelectorAll(sel))
                                     .map(el => el.outerHTML)
-                                    .join('')"""
+                                    .join('')""",
+                                selector,
                             )
                             html_parts.append(content)
                         except Error as e:
@@ -1225,7 +1272,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 try:
                     all_contexts = page.context.browser.contexts
                     total_pages = sum(len(context.pages) for context in all_contexts)
-                    if not (total_pages <= 1 and (self.browser_config.use_managed_browser or self.browser_config.headless)):
+                    keep_last = total_pages <= 1 and (
+                        self.browser_config.use_managed_browser or self.browser_config.headless
+                    )
+                    if keep_last:
+                        # Headless Chromium exits if its last page is closed.
+                        # Blank the retained page so the crawled document does
+                        # not stay resident for the life of the pooled browser.
+                        with contextlib.suppress(Exception):
+                            await page.goto("about:blank", wait_until="commit", timeout=5000)
+                    else:
                         await page.close()
                 except Exception:
                     pass
@@ -2642,6 +2698,8 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
 
         if username and password:
             # Insert credentials into URL: http://user:pass@host:port
+            username = quote(username, safe='')
+            password = quote(password, safe='')
             if '://' in server:
                 protocol, rest = server.split('://', 1)
                 return f"{protocol}://{username}:{password}@{rest}"
@@ -2649,6 +2707,42 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
                 return f"http://{username}:{password}@{server}"
 
         return server
+
+    # scheme://user:pass@ in any URL inside a message
+    _URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
+
+    @classmethod
+    def _redact_proxy_credentials(cls, message: str, proxy_url: Optional[str]) -> str:
+        """Mask proxy credentials in an error message before it is raised.
+
+        Some aiohttp errors quote the proxy URL (``InvalidURL`` carries all of
+        it), and the errors raised from ``_handle_http`` end up in logs and in
+        crawl results.
+        """
+        if proxy_url and "@" in proxy_url:
+            from urllib.parse import unquote
+
+            userinfo = proxy_url.split("://", 1)[-1].rsplit("@", 1)[0]
+            # The exact string first: a password with "/" or "#" in it is not
+            # matched whole by the pattern below.
+            for secret in {userinfo, unquote(userinfo)}:
+                message = message.replace(secret + "@", "***@")
+        return cls._URL_USERINFO.sub(r"\1***@", message)
+
+    @classmethod
+    def _wrap_error(cls, exc_type, prefix: str, error: BaseException, proxy_url: Optional[str]):
+        """``exc_type(f"{prefix}: {error}")`` with proxy credentials masked.
+
+        When the original message carried credentials, it is also kept out of
+        the traceback, which would otherwise print it under "During handling
+        of the above exception".
+        """
+        text = str(error)
+        safe = cls._redact_proxy_credentials(text, proxy_url)
+        wrapped = exc_type(f"{prefix}: {safe}")
+        if safe != text:
+            wrapped.__suppress_context__ = True
+        return wrapped
 
     # Content types treated as text (decoded into html field)
     _TEXT_CONTENT_TYPES: Final = frozenset({
@@ -2807,23 +2901,23 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
 
             except aiohttp.ServerTimeoutError as e:
                 await self.hooks['on_error'](e)
-                raise ConnectionTimeoutError(f"Request timed out: {str(e)}")
+                raise self._wrap_error(ConnectionTimeoutError, "Request timed out", e, proxy_url)
                 
             except aiohttp.ClientConnectorError as e:
                 await self.hooks['on_error'](e)
-                raise ConnectionError(f"Connection failed: {str(e)}")
+                raise self._wrap_error(ConnectionError, "Connection failed", e, proxy_url)
                 
             except aiohttp.ClientError as e:
                 await self.hooks['on_error'](e)
-                raise HTTPCrawlerError(f"HTTP client error: {str(e)}")
+                raise self._wrap_error(HTTPCrawlerError, "HTTP client error", e, proxy_url)
             
             except asyncio.exceptions.TimeoutError as e:
                 await self.hooks['on_error'](e)
-                raise ConnectionTimeoutError(f"Request timed out: {str(e)}")
+                raise self._wrap_error(ConnectionTimeoutError, "Request timed out", e, proxy_url)
             
             except Exception as e:
                 await self.hooks['on_error'](e)
-                raise HTTPCrawlerError(f"HTTP request failed: {str(e)}")
+                raise self._wrap_error(HTTPCrawlerError, "HTTP request failed", e, proxy_url)
 
     async def crawl(
         self, 

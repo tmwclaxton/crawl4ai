@@ -13,7 +13,7 @@ from crawl4ai.async_configs import Provenance, UntrustedConfigError
 from crawl4ai.__version__ import __version__
 from auth import (
     create_access_token, get_token_dependency, TokenRequest,
-    constant_time_eq, resolve_secret_key,
+    constant_time_eq, is_trusted_backend, resolve_secret_key,
 )
 from auth_gate import AuthGateMiddleware
 from pydantic import BaseModel
@@ -102,6 +102,8 @@ EXECUTE_JS_ENABLED = os.environ.get("CRAWL4AI_EXECUTE_JS_ENABLED", "false").lowe
 # an unprivileged user namespace (unprivileged_userns_clone=1) or a seccomp
 # profile, set CRAWL4AI_CHROMIUM_SANDBOX=true to drop --no-sandbox and run the
 # renderer sandboxed. Verify Chromium still starts after flipping it.
+# crawl4ai.browser_manager reads the same variable at launch, so the sandbox
+# also applies to browsers built from a request body, not only this config.
 CHROMIUM_SANDBOX = os.environ.get("CRAWL4AI_CHROMIUM_SANDBOX", "false").lower() == "true"
 
 # Warn loudly if API token is not set (all endpoints unauthenticated)
@@ -363,8 +365,25 @@ async def monitor_ui_redirect():
 # ─────────────────── infra / middleware  ─────────────────────
 redis = aioredis.from_url(_build_redis_url(config))
 
+def rate_limit_key(request: Request) -> str:
+    """Bucket by token, not by client IP.
+
+    The public edge fronts every caller with one address, so an IP bucket
+    either shares one limit across GrantGunner and every MCP user, or lets a
+    leaked token spend at the full IP rate. The operator API token and each
+    JWT subject get their own bucket.
+    """
+    principal = getattr(request.state, "principal", None)
+    if isinstance(principal, dict):
+        sub = principal.get("sub") or principal.get("email")
+        if sub:
+            via = principal.get("via") or "jwt"
+            return f"{via}:{sub}"
+    return get_remote_address(request)
+
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=rate_limit_key,
     default_limits=[config["rate_limiting"]["default_limit"]],
     storage_uri=_build_rate_limit_storage_uri(config),
 )
@@ -464,6 +483,95 @@ def _current_api_token() -> str:
 
 
 from mcp_oauth import OAUTH_PUBLIC_PATHS, OAUTH_PUBLIC_PREFIXES, attach_oauth
+
+# Added before AuthGate so it runs after auth has attached the principal.
+# Untrusted JWT subjects (MCP and other callers) get a tighter per-minute
+# cap than the SlowAPI default. The operator API token, JWTs minted by
+# POST /token, and CRAWL4AI_TRUSTED_SUBJECTS are exempt so GrantGunner
+# (Scout, enrichment, autofill) is not capped with those callers.
+# This window is in-process, so each gunicorn worker counts its own hits.
+_TOKEN_RATE_WINDOW_S = 60
+_token_hits: Dict[str, list] = {}
+
+
+def _token_rate_limit() -> int:
+    """Per-minute cap for untrusted JWT subjects.
+
+    CRAWL4AI_TOKEN_RATE_PER_MINUTE defaults to 60. A negative value means
+    unlimited. A value that is not an integer falls back to 60. Trusted
+    backend callers never reach this function.
+    """
+    raw = os.environ.get("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "60")
+    try:
+        limit = int(str(raw).strip())
+    except ValueError:
+        limit = 60
+    if limit < 0:
+        return limit
+    return max(limit, 1)
+
+
+class TokenRateLimitMiddleware:
+    """Per-minute cap for untrusted JWT callers.
+
+    Exempt (no per-minute cap, and marked so the daily paid caps skip them):
+    the operator API token, a JWT with via=operator from POST /token, and
+    any subject in CRAWL4AI_TRUSTED_SUBJECTS.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        import usage_log
+        usage_log.current_client.set("anonymous")
+        if path in {HEALTH_PATH, "/token", "/", "/monitor"} or path.startswith(
+            ("/dashboard", "/playground", "/static", "/oauth", "/.well-known")
+        ):
+            await self.app(scope, receive, send)
+            return
+        state = scope.get("state") or {}
+        principal = state.get("principal") if isinstance(state, dict) else None
+        if not isinstance(principal, dict):
+            await self.app(scope, receive, send)
+            return
+        sub = str(principal.get("sub") or principal.get("email") or "caller")
+        if is_trusted_backend(principal):
+            # trusted: prefix tells allow_paid to skip the daily caps.
+            usage_log.current_client.set(f"trusted:{sub}")
+            await self.app(scope, receive, send)
+            return
+        usage_log.current_client.set(f"jwt:{sub}")
+        limit = _token_rate_limit()
+        if limit < 0:
+            await self.app(scope, receive, send)
+            return
+        now = time.time()
+        bucket = _token_hits.setdefault(sub, [])
+        cutoff = now - _TOKEN_RATE_WINDOW_S
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+        if len(bucket) >= limit:
+            body = b'{"detail":"Rate limit exceeded for this token"}'
+            await send({
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        bucket.append(now)
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(TokenRateLimitMiddleware)
 
 app.add_middleware(
     AuthGateMiddleware,
@@ -632,7 +740,11 @@ async def get_token(req: TokenRequest):
         raise HTTPException(401, "Invalid or missing api_token")
     if not verify_email_domain(req.email):
         raise HTTPException(400, "Invalid email domain")
-    token = create_access_token({"sub": req.email})
+    # via=operator marks a JWT minted with the operator API token. GrantGunner
+    # swaps that token for this JWT and then calls the API with it. The rate
+    # limiter and the daily paid caps treat that subject as the trusted backend.
+    # MCP OAuth tokens are minted on a different path and do not get this claim.
+    token = create_access_token({"sub": req.email, "via": "operator"})
     return {"email": req.email, "access_token": token, "token_type": "bearer"}
 
 
@@ -933,8 +1045,8 @@ async def execute_js(
             html: str
             success: bool
             cleaned_html: Optional[str] = None
-            media: Dict[str, List[Dict]] = {}
-            links: Dict[str, List[Dict]] = {}
+            media: Dict[str, List[Dict]] = {"images": [], "videos": [], "audios": []}
+            links: Dict[str, List[Dict]] = {"internal": [], "external": []}
             downloaded_files: Optional[List[str]] = None
             js_execution_result: Optional[Dict[str, Any]] = None
             screenshot: Optional[str] = None
@@ -1035,7 +1147,14 @@ async def get_hooks_info():
 
 @app.get(config["observability"]["health_check"]["endpoint"])
 async def health():
-    return {"status": "ok", "timestamp": time.time(), "version": __version__}
+    # CRAWL4AI_GIT_SHA is baked into the image at build time. "unknown" means
+    # the image was built without the label, which is itself deploy drift.
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "version": __version__,
+        "git_sha": os.environ.get("CRAWL4AI_GIT_SHA", "unknown"),
+    }
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])
@@ -1173,6 +1292,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         config=config,
         hooks_config=hooks_config,
         **({"site_profile": crawl_request.site_profile} if crawl_request.site_profile is not None else {}),
+        crawler_configs=crawl_request.crawler_configs,
     )
     
     # Add hooks info to response headers if available

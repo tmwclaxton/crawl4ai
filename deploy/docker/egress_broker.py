@@ -25,11 +25,14 @@ leaks a resolved internal IP, hostname, or traceback (the old DNS oracle).
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
 from dataclasses import dataclass
 from typing import List, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger("crawl4ai.security")
 
 # Operator escape hatch for trusted internal deployments (off by default).
 ALLOW_INTERNAL = os.environ.get("CRAWL4AI_ALLOW_INTERNAL_URLS", "false").lower() == "true"
@@ -43,7 +46,49 @@ _6TO4 = ipaddress.ip_network("2002::/16")
 _BLOCKED_HOSTNAMES = {
     "localhost", "metadata.google.internal", "metadata",
     "kubernetes.default", "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster.local",
 }
+
+# Single-label names (grantgunner-app-1, redis, mysql) and these suffixes are
+# Docker DNS, mDNS, or search-domain hits. They are not public web hosts.
+# A name with no dot is refused before DNS so a search path cannot turn it
+# into an internal address after the check.
+_BLOCKED_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".internal",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".localdomain",
+    ".corp",
+    ".intranet",
+    ".docker",
+    ".docker.internal",
+)
+
+
+def _literal_ip(host: str):
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def host_is_denied(host: str) -> bool:
+    """True for names that must never be fetched, before DNS is consulted."""
+    if not host:
+        return True
+    low = host.lower().rstrip(".")
+    if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
+        return True
+    if low.endswith(".svc.cluster.local") or low.endswith(".cluster.local"):
+        return True
+    if _literal_ip(low) is not None:
+        return False
+    if "." not in low:
+        return True
+    return any(low.endswith(suffix) for suffix in _BLOCKED_SUFFIXES)
 
 
 class EgressBlocked(Exception):
@@ -100,10 +145,10 @@ def assert_host_allowed(host: str, port: int = 0) -> None:
     """Resolve `host` and reject if ANY answer is non-global. Opaque on failure."""
     if ALLOW_INTERNAL:
         return
-    if not host:
+    if not host or host_is_denied(host):
         raise EgressBlocked()
-    low = host.lower()
-    if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
+    literal = _literal_ip(host)
+    if literal is not None and is_forbidden_ip(str(literal)):
         raise EgressBlocked()
     for *_, sockaddr in _resolve(host, port):
         if is_forbidden_ip(sockaddr[0]):
@@ -130,8 +175,10 @@ def resolve_and_pin(url: str) -> PinnedTarget:
         answers = _resolve(host, port)
         return PinnedTarget(scheme, host, port, answers[0][4][0])
 
-    low = host.lower()
-    if low in _BLOCKED_HOSTNAMES or low.startswith("host.docker.internal"):
+    if host_is_denied(host):
+        raise EgressBlocked()
+    literal = _literal_ip(host)
+    if literal is not None and is_forbidden_ip(str(literal)):
         raise EgressBlocked()
 
     answers = _resolve(host, port)
@@ -200,7 +247,16 @@ def enforce_egress(browser_config) -> None:
             from crawl4ai import ProxyConfig
             browser_config.proxy_config = ProxyConfig(server=_EGRESS_PROXY_URL)
         except Exception:
-            pass
+            # Fail closed: a browser_config that can't be pinned must not be
+            # allowed to crawl unpinned (that reopens DNS rebinding). Every
+            # caller of enforce_egress either runs inside a try/except that
+            # turns this into a clean 4xx/5xx response, or (app startup) is
+            # meant to abort loudly rather than serve traffic unprotected.
+            logger.error(
+                "enforce_egress: failed to set the egress pinning proxy; "
+                "refusing to crawl unpinned", exc_info=True
+            )
+            raise EgressBlocked("egress pinning unavailable")
     args = getattr(browser_config, "extra_args", None)
     if args:
         browser_config.extra_args = [

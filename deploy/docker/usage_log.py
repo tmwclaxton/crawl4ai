@@ -18,10 +18,22 @@ What it does:
 No URLs, request bodies or tokens are stored. Recording never breaks a request.
 """
 import json
+import os
 import time
+from contextvars import ContextVar
 from typing import Optional
 
 from fastapi import APIRouter, Query, Request
+
+from auth import trusted_backend_subjects
+
+# Who the current request is spending as. Set by the token rate-limit middleware
+# after auth. Paid fallbacks read it so a daily cap is per token, not global.
+current_client: ContextVar[str] = ContextVar("usage_current_client", default="anonymous")
+
+# In-process fallback when Redis is down. Tests and a Redis blip still enforce
+# the cap inside this process (gunicorn runs one worker).
+_mem_spend: dict = {}
 
 KEY_LIST = "usage:calls"
 KEY_SEQ = "usage:seq"
@@ -112,6 +124,66 @@ async def record_mcp_tool(name: str, ok: bool, started: float, error: Optional[s
         "client": client,
         "error": (error or None) and str(error)[:200],
     })
+
+
+def _client_skips_paid_cap(client: str) -> bool:
+    """Trusted backend callers are not counted against the daily paid caps.
+
+    The rate-limit middleware marks them with a trusted: prefix. A jwt:
+    subject listed in CRAWL4AI_TRUSTED_SUBJECTS is skipped too, in case the
+    cap is checked without that prefix. api_token: is the raw operator token.
+    """
+    if client.startswith("trusted:") or client.startswith("api_token:"):
+        return True
+    if client.startswith("jwt:"):
+        sub = client.split(":", 1)[1].strip().lower()
+        return bool(sub) and sub in trusted_backend_subjects()
+    return False
+
+
+def _paid_cap(kind: str) -> int:
+    """Daily paid-call cap for one untrusted token. Negative means unlimited."""
+    defaults = {"firecrawl": "500", "proxy": "1000", "nanogpt": "5000"}
+    env_name = {
+        "firecrawl": "CRAWL4AI_DAILY_FIRECRAWL_CAP",
+        "proxy": "CRAWL4AI_DAILY_PROXY_CAP",
+        "nanogpt": "CRAWL4AI_DAILY_NANOGPT_CAP",
+    }.get(kind)
+    raw = os.environ.get(env_name or "", defaults.get(kind, "0"))
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return int(defaults.get(kind, "0"))
+
+
+async def allow_paid(kind: str) -> bool:
+    """Reserve one paid call for the current token today.
+
+    False means the daily cap is spent. Callers skip the paid provider and
+    return the local result, so a capped token still gets the free crawl.
+    """
+    cap = _paid_cap(kind)
+    if cap < 0:
+        return True
+    client = current_client.get() or "anonymous"
+    if _client_skips_paid_cap(client):
+        return True
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    key = f"usage:spend:{client}:{day}:{kind}"
+    if _redis is not None:
+        try:
+            count = int(await _redis.incr(key))
+            if count == 1:
+                await _redis.expire(key, 172800)
+            if count > cap:
+                await _redis.decr(key)
+                return False
+            return True
+        except Exception:
+            pass
+    count = int(_mem_spend.get(key, 0)) + 1
+    _mem_spend[key] = count
+    return count <= cap
 
 
 router = APIRouter(prefix="/monitor", tags=["monitor"])

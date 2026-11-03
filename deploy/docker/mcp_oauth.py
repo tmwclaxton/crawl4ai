@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 OAUTH_SCOPE = "mcp:use"
 ACCESS_TTL = timedelta(hours=1)
-REFRESH_TTL_SECONDS = 30 * 24 * 3600
+# Seven days, down from 30. The access token is one hour; a stolen refresh
+# token should not keep an MCP client alive for a month.
+REFRESH_TTL_SECONDS = 7 * 24 * 3600
 CODE_TTL_SECONDS = 600
 _CUSTOM_SCHEMES = {"cursor", "vscode", "vscode-insiders", "claude"}
 
