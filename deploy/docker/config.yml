@@ -54,8 +54,10 @@ limits:
 rate_limiting:
   enabled: True
   # Per token (see server.rate_limit_key), not per IP. 1000/minute is the
-  # operator ceiling so GrantGunner is not throttled. JWT subjects are also
-  # capped at CRAWL4AI_TOKEN_RATE_PER_MINUTE (default 60) by TokenRateLimitMiddleware.
+  # SlowAPI ceiling on decorated routes. Untrusted JWT subjects are also
+  # capped at CRAWL4AI_TOKEN_RATE_PER_MINUTE (default 60; negative means
+  # unlimited) by TokenRateLimitMiddleware. The operator API token, JWTs
+  # from POST /token (via=operator), and CRAWL4AI_TRUSTED_SUBJECTS are exempt.
   default_limit: "1000/minute"
   trusted_proxies: []
   storage_uri: "memory://"  # Use "redis://crawl4ai_redis:6379" for production
@@ -74,6 +76,8 @@ security:
   https_redirect: false
   # Host header allow-list. testserver is the in-process test client.
   # crawl4ai is the compose service name for calls that do not use the public host.
+  # CRAWL4AI_TRUSTED_HOSTS is a comma-separated list of extra names appended
+  # to this list (other internal hostnames, extra public names).
   trusted_hosts:
     - "crawl4ai.grantgunner.org"
     - "crawl4ai"

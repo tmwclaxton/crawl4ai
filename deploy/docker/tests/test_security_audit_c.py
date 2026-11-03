@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from auth import ACCESS_TOKEN_EXPIRE_MINUTES, create_access_token
+from auth import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    create_access_token,
+    decode_token,
+    is_trusted_backend,
+)
 from egress_broker import EgressBlocked, check_redirect, host_is_denied, resolve_and_pin
 from mcp_oauth import ACCESS_TTL, REFRESH_TTL_SECONDS
 from site_tools import ToolError, run_map
@@ -213,6 +218,7 @@ def test_paid_cap_is_per_token(monkeypatch):
     monkeypatch.setattr(usage_log, "_redis", None)
     usage_log._mem_spend.clear()
     monkeypatch.setenv("CRAWL4AI_DAILY_FIRECRAWL_CAP", "1")
+    monkeypatch.delenv("CRAWL4AI_TRUSTED_SUBJECTS", raising=False)
     first = usage_log.current_client.set("jwt:alice")
     try:
         assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
@@ -224,6 +230,62 @@ def test_paid_cap_is_per_token(monkeypatch):
         assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
     finally:
         usage_log.current_client.reset(second)
+
+
+def test_trusted_backend_skips_daily_paid_caps(monkeypatch):
+    import usage_log
+
+    monkeypatch.setattr(usage_log, "_redis", None)
+    usage_log._mem_spend.clear()
+    monkeypatch.setenv("CRAWL4AI_DAILY_FIRECRAWL_CAP", "1")
+    monkeypatch.setenv("CRAWL4AI_DAILY_PROXY_CAP", "1")
+    monkeypatch.setenv("CRAWL4AI_DAILY_NANOGPT_CAP", "1")
+    monkeypatch.setenv("CRAWL4AI_TRUSTED_SUBJECTS", "backend@grantgunner.org")
+
+    trusted = usage_log.current_client.set("trusted:backend@grantgunner.org")
+    try:
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+        assert asyncio.run(usage_log.allow_paid("proxy")) is True
+        assert asyncio.run(usage_log.allow_paid("nanogpt")) is True
+    finally:
+        usage_log.current_client.reset(trusted)
+
+    named = usage_log.current_client.set("jwt:backend@grantgunner.org")
+    try:
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+    finally:
+        usage_log.current_client.reset(named)
+
+    operator = usage_log.current_client.set("api_token:operator")
+    try:
+        assert asyncio.run(usage_log.allow_paid("proxy")) is True
+        assert asyncio.run(usage_log.allow_paid("proxy")) is True
+    finally:
+        usage_log.current_client.reset(operator)
+
+    other = usage_log.current_client.set("jwt:mcp-client")
+    try:
+        assert asyncio.run(usage_log.allow_paid("nanogpt")) is True
+        assert asyncio.run(usage_log.allow_paid("nanogpt")) is False
+    finally:
+        usage_log.current_client.reset(other)
+
+
+def test_negative_paid_cap_is_unlimited(monkeypatch):
+    import usage_log
+
+    monkeypatch.setattr(usage_log, "_redis", None)
+    usage_log._mem_spend.clear()
+    monkeypatch.setenv("CRAWL4AI_DAILY_FIRECRAWL_CAP", "-1")
+    monkeypatch.delenv("CRAWL4AI_TRUSTED_SUBJECTS", raising=False)
+    token = usage_log.current_client.set("jwt:mcp-client")
+    try:
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+        assert asyncio.run(usage_log.allow_paid("firecrawl")) is True
+    finally:
+        usage_log.current_client.reset(token)
 
 
 def test_jwt_lifetime_stays_short():
@@ -249,12 +311,60 @@ def test_trusted_hosts_are_explicit(server_module):
     hosts = server_module.config["security"]["trusted_hosts"]
     assert hosts != ["*"]
     assert "crawl4ai.grantgunner.org" in hosts
+    assert "crawl4ai" in hosts
     assert "localhost" in hosts
+    assert "127.0.0.1" in hosts
+    assert "testserver" in hosts
 
 
-def test_jwt_callers_are_rate_limited_and_the_operator_token_is_not(stock_client, monkeypatch):
+def test_trusted_hosts_env_appends_extras(monkeypatch):
+    from utils import load_config, resolve_trusted_hosts
+
+    monkeypatch.setenv("CRAWL4AI_TRUSTED_HOSTS", "gg-agents, crawl4ai.internal, localhost")
+    hosts = resolve_trusted_hosts([
+        "crawl4ai.grantgunner.org",
+        "crawl4ai",
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    ])
+    assert hosts[:5] == [
+        "crawl4ai.grantgunner.org",
+        "crawl4ai",
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    ]
+    assert "gg-agents" in hosts
+    assert "crawl4ai.internal" in hosts
+    assert hosts.count("localhost") == 1
+
+    loaded = load_config()
+    assert "gg-agents" in loaded["security"]["trusted_hosts"]
+    assert "crawl4ai.grantgunner.org" in loaded["security"]["trusted_hosts"]
+    assert "127.0.0.1" in loaded["security"]["trusted_hosts"]
+
+
+def test_token_endpoint_stamps_operator_via(stock_client, server_module, monkeypatch):
+    monkeypatch.setitem(server_module.config["security"], "api_token", "operator-token-value")
+    monkeypatch.setattr(server_module, "verify_email_domain", lambda email: True)
+    response = stock_client.post(
+        "/token",
+        json={"email": "backend@grantgunner.org", "api_token": "operator-token-value"},
+    )
+    assert response.status_code == 200
+    claims = decode_token(response.json()["access_token"])
+    assert claims["sub"] == "backend@grantgunner.org"
+    assert claims["via"] == "operator"
+    assert is_trusted_backend(claims) is True
+    assert is_trusted_backend({"sub": "mcp-client", "scope": "data"}) is False
+
+
+def test_jwt_callers_are_rate_limited_and_the_operator_token_is_not(stock_client, server_module, monkeypatch):
     monkeypatch.setenv("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "2")
+    monkeypatch.delenv("CRAWL4AI_TRUSTED_SUBJECTS", raising=False)
     monkeypatch.setenv("CRAWL4AI_API_TOKEN", "operator-token-value")
+    server_module._token_hits.clear()
     user = create_access_token({"sub": "mcp-user@example.com"})
     user_headers = {"Authorization": f"Bearer {user}"}
     user_codes = [stock_client.get("/schema", headers=user_headers).status_code for _ in range(3)]
@@ -266,6 +376,52 @@ def test_jwt_callers_are_rate_limited_and_the_operator_token_is_not(stock_client
     assert 429 not in op_codes
 
 
+def test_operator_issued_jwt_is_exempt_from_the_per_minute_cap(stock_client, server_module, monkeypatch):
+    """60 or more requests from the backend subject must not 429.
+
+    GrantGunner swaps the operator token for this JWT at POST /token and
+    then sends it on every scrape and search call.
+    """
+    monkeypatch.setenv("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "60")
+    monkeypatch.delenv("CRAWL4AI_TRUSTED_SUBJECTS", raising=False)
+    server_module._token_hits.clear()
+    backend = create_access_token({"sub": "backend@grantgunner.org", "via": "operator"})
+    headers = {"Authorization": f"Bearer {backend}"}
+    codes = [stock_client.get("/schema", headers=headers).status_code for _ in range(61)]
+    assert 429 not in codes
+    assert codes[0] != 401
+
+
+def test_named_trusted_subject_is_exempt_and_other_subjects_are_not(stock_client, server_module, monkeypatch):
+    monkeypatch.setenv("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "2")
+    monkeypatch.setenv("CRAWL4AI_TRUSTED_SUBJECTS", "Backend@GrantGunner.org")
+    server_module._token_hits.clear()
+    trusted = create_access_token({"sub": "backend@grantgunner.org"})
+    trusted_codes = [
+        stock_client.get("/schema", headers={"Authorization": f"Bearer {trusted}"}).status_code
+        for _ in range(5)
+    ]
+    assert 429 not in trusted_codes
+
+    other = create_access_token({"sub": "mcp-client"})
+    other_codes = [
+        stock_client.get("/schema", headers={"Authorization": f"Bearer {other}"}).status_code
+        for _ in range(3)
+    ]
+    assert other_codes[0] != 429
+    assert other_codes[2] == 429
+
+
+def test_negative_token_rate_is_unlimited(stock_client, server_module, monkeypatch):
+    monkeypatch.setenv("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "-1")
+    monkeypatch.delenv("CRAWL4AI_TRUSTED_SUBJECTS", raising=False)
+    server_module._token_hits.clear()
+    user = create_access_token({"sub": "mcp-user@example.com"})
+    headers = {"Authorization": f"Bearer {user}"}
+    codes = [stock_client.get("/schema", headers=headers).status_code for _ in range(5)]
+    assert 429 not in codes
+
+
 def test_compose_and_image_record_the_audit_fixes():
     compose = (ROOT / "docker-compose.yml").read_text()
     dockerfile = (ROOT / "Dockerfile").read_text()
@@ -273,11 +429,26 @@ def test_compose_and_image_record_the_audit_fixes():
     nginx = (DOCKER / "nginx-edge.conf").read_text()
     assert "mem_limit: 4g" in compose
     assert "CRAWL4AI_DISABLE_RATE_LIMITER=${CRAWL4AI_DISABLE_RATE_LIMITER:-false}" in compose
+    assert "CRAWL4AI_TOKEN_RATE_PER_MINUTE=${CRAWL4AI_TOKEN_RATE_PER_MINUTE:-60}" in compose
+    assert "CRAWL4AI_TRUSTED_SUBJECTS=${CRAWL4AI_TRUSTED_SUBJECTS:-}" in compose
+    assert "CRAWL4AI_TRUSTED_HOSTS=${CRAWL4AI_TRUSTED_HOSTS:-}" in compose
+    assert "CRAWL4AI_DAILY_FIRECRAWL_CAP=${CRAWL4AI_DAILY_FIRECRAWL_CAP:-500}" in compose
+    assert "CRAWL4AI_DAILY_PROXY_CAP=${CRAWL4AI_DAILY_PROXY_CAP:-1000}" in compose
+    assert "CRAWL4AI_DAILY_NANOGPT_CAP=${CRAWL4AI_DAILY_NANOGPT_CAP:-5000}" in compose
+    assert "Negative means unlimited" in compose
     assert "crawl4ai_redis:" in compose
     assert "REDIS_HOST=crawl4ai_redis" in compose
+    assert "local-dev-crawl4ai-redis" not in compose
+    assert "${REDIS_PASSWORD:?" in compose
+    assert "volatile-lru" in compose
+    assert "allkeys-lru" not in compose
+    assert "REDIS_MAXMEMORY:-1gb" in compose
+    assert "crawl4ai_redis_data" in compose
     assert "GIT_SHA" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert 'REDIS_HOST}" == "redis"' in entry or 'REDIS_HOST}" == "redis"' in entry.replace(" ", "")
     assert "refusing REDIS_HOST=redis" in entry
+    assert "REDIS_PASSWORD is required when REDIS_HOST" in entry
+    assert "There is no default password" in entry
     assert "proxy_read_timeout 330s" in nginx
     assert "client_max_body_size 10m" in nginx

@@ -25,6 +25,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Query, Request
 
+from auth import trusted_backend_subjects
+
 # Who the current request is spending as. Set by the token rate-limit middleware
 # after auth. Paid fallbacks read it so a daily cap is per token, not global.
 current_client: ContextVar[str] = ContextVar("usage_current_client", default="anonymous")
@@ -124,8 +126,23 @@ async def record_mcp_tool(name: str, ok: bool, started: float, error: Optional[s
     })
 
 
+def _client_skips_paid_cap(client: str) -> bool:
+    """Trusted backend callers are not counted against the daily paid caps.
+
+    The rate-limit middleware marks them with a trusted: prefix. A jwt:
+    subject listed in CRAWL4AI_TRUSTED_SUBJECTS is skipped too, in case the
+    cap is checked without that prefix. api_token: is the raw operator token.
+    """
+    if client.startswith("trusted:") or client.startswith("api_token:"):
+        return True
+    if client.startswith("jwt:"):
+        sub = client.split(":", 1)[1].strip().lower()
+        return bool(sub) and sub in trusted_backend_subjects()
+    return False
+
+
 def _paid_cap(kind: str) -> int:
-    """Daily paid-call cap for one token. Negative means unlimited."""
+    """Daily paid-call cap for one untrusted token. Negative means unlimited."""
     defaults = {"firecrawl": "500", "proxy": "1000", "nanogpt": "5000"}
     env_name = {
         "firecrawl": "CRAWL4AI_DAILY_FIRECRAWL_CAP",
@@ -149,6 +166,8 @@ async def allow_paid(kind: str) -> bool:
     if cap < 0:
         return True
     client = current_client.get() or "anonymous"
+    if _client_skips_paid_cap(client):
+        return True
     day = time.strftime("%Y-%m-%d", time.gmtime())
     key = f"usage:spend:{client}:{day}:{kind}"
     if _redis is not None:

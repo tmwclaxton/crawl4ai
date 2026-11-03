@@ -13,17 +13,31 @@ x-base-config: &base-config
     - CRAWL4AI_FIRECRAWL_FALLBACK=${CRAWL4AI_FIRECRAWL_FALLBACK:-false}
     - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}
     - CRAWL4AI_PAGE_TIMEOUT_MS=${CRAWL4AI_PAGE_TIMEOUT_MS:-15000}
-    # The same-host crawl pause is on. Set true only for a private batch job.
+    # The same-host crawl pause is on (about 1 to 2 seconds per host).
+    # Set true only for a private batch job that must turn the pause off.
     - CRAWL4AI_DISABLE_RATE_LIMITER=${CRAWL4AI_DISABLE_RATE_LIMITER:-false}
     # Public origin used in the MCP OAuth discovery documents.
     - CRAWL4AI_PUBLIC_BASE_URL=${CRAWL4AI_PUBLIC_BASE_URL:-https://crawl4ai.grantgunner.org}
     # Deep crawling over the API (off unless set to true in the shell or .env).
     - CRAWL4AI_ALLOW_DEEP_CRAWL=${CRAWL4AI_ALLOW_DEEP_CRAWL:-false}
+    # Per-minute cap for untrusted JWT subjects (MCP and other callers).
+    # Negative means unlimited. The operator API token, JWTs from POST /token
+    # (via=operator), and CRAWL4AI_TRUSTED_SUBJECTS are exempt.
+    - CRAWL4AI_TOKEN_RATE_PER_MINUTE=${CRAWL4AI_TOKEN_RATE_PER_MINUTE:-60}
+    # Extra JWT subjects that skip the per-minute cap and the daily paid caps.
+    # Comma-separated. Operator-issued JWTs are already exempt without this.
+    - CRAWL4AI_TRUSTED_SUBJECTS=${CRAWL4AI_TRUSTED_SUBJECTS:-}
+    # Extra Host header names, comma-separated. Appended to the defaults
+    # crawl4ai.grantgunner.org, crawl4ai, localhost, 127.0.0.1, testserver.
+    - CRAWL4AI_TRUSTED_HOSTS=${CRAWL4AI_TRUSTED_HOSTS:-}
     # Talk to this stack's Redis by its service name. Never set this to "redis":
     # on a shared Docker network that name is ambiguous.
     - REDIS_HOST=crawl4ai_redis
-    - REDIS_PASSWORD=${REDIS_PASSWORD:-local-dev-crawl4ai-redis}
-    # Daily caps on paid fallbacks, per token. Negative means unlimited.
+    # Required. No default password is shipped. The production service of this
+    # name was passwordless: set the same password here and on that Redis.
+    - "REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in the shell or a .env file before docker compose up. There is no default password. The service name stays crawl4ai_redis. Set this same password on that Redis before the app starts.}"
+    # Daily caps on paid fallbacks, per untrusted token. Negative means unlimited.
+    # The trusted backend subject is exempt.
     - CRAWL4AI_DAILY_FIRECRAWL_CAP=${CRAWL4AI_DAILY_FIRECRAWL_CAP:-500}
     - CRAWL4AI_DAILY_PROXY_CAP=${CRAWL4AI_DAILY_PROXY_CAP:-1000}
     - CRAWL4AI_DAILY_NANOGPT_CAP=${CRAWL4AI_DAILY_NANOGPT_CAP:-5000}
@@ -103,25 +117,37 @@ services:
     # Inherit shared config
     <<: *base-config
 
-  # Dedicated Redis for this stack. The service name is the DNS name.
+  # Dedicated Redis for this stack. The service name is the DNS name and
+  # stays crawl4ai_redis so existing clients keep the same host. This file
+  # owns that service: do not run a second Redis that also answers as
+  # crawl4ai_redis on a shared network.
   # Do not add a network alias of "redis": crawl4ai is also attached to other
   # compose networks where a different Redis is already called redis, and
   # clients (including vidgaze, if it shares this network) will hit the wrong one.
-  # Do not publish the port. Set REDIS_PASSWORD before any production up;
-  # the default below is only so a local `docker compose up` can boot.
+  # Do not publish the port. REDIS_PASSWORD is required. There is no default.
+  # The previous production instance was passwordless. Set requirepass to the
+  # same value before the app starts, or AUTH fails.
+  # volatile-lru evicts only keys that already have a TTL, and only after
+  # maxmemory. Job hashes use task_ttl_seconds (default 3600). Keys without
+  # a TTL (monitors, the usage log) are kept. Raise REDIS_MAXMEMORY when
+  # crawl results are large. The named volume keeps data across recreates.
+  # A new volume does not contain an older container's data directory.
   crawl4ai_redis:
     image: redis:7.2.7-alpine
     command:
       - redis-server
       - --requirepass
-      - ${REDIS_PASSWORD:-local-dev-crawl4ai-redis}
+      - "${REDIS_PASSWORD:?Set REDIS_PASSWORD in the shell or a .env file before docker compose up. There is no default password. The service name stays crawl4ai_redis. Set this same password on that Redis before the app starts.}"
       - --maxmemory
-      - 256mb
+      - ${REDIS_MAXMEMORY:-1gb}
       - --maxmemory-policy
-      - allkeys-lru
+      - volatile-lru
       - --bind
       - 0.0.0.0
+    volumes:
+      - crawl4ai_redis_data:/data
     restart: unless-stopped
 
 volumes:
   crawl4ai_page_cache:
+  crawl4ai_redis_data:

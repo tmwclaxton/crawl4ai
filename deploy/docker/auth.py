@@ -30,9 +30,10 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, EmailStr
 
 # 60 minutes, reviewed against the old 1440 minute tokens. A leaked JWT
-# should die within the hour. GrantGunner uses the static API token, so
-# shortening this does not drop that client. OAuth refresh is separate
-# and is capped in mcp_oauth.REFRESH_TTL_SECONDS.
+# should die within the hour. GrantGunner remints through POST /token,
+# which stamps via=operator so that backend JWT stays exempt from the
+# per-minute and daily caps. OAuth refresh is separate and is capped in
+# mcp_oauth.REFRESH_TTL_SECONDS.
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 ALGORITHM = "HS256"
 _ALGORITHMS = [ALGORITHM]  # a LIST on purpose: no substring matching, no alg:none
@@ -115,6 +116,36 @@ def decode_token(token: str) -> Dict:
 def constant_time_eq(a: str, b: str) -> bool:
     """Timing-safe string comparison for the static API token."""
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def trusted_backend_subjects() -> set:
+    """JWT subjects that skip the per-minute cap and the daily paid caps.
+
+    Comma-separated, case-insensitive. CRAWL4AI_TRUSTED_SUBJECTS is for a
+    backend email you want to name explicitly. POST /token already stamps
+    via=operator, and the raw operator API token is exempt without this list.
+    """
+    raw = os.environ.get("CRAWL4AI_TRUSTED_SUBJECTS", "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def is_trusted_backend(principal: Optional[Dict]) -> bool:
+    """True for the GrantGunner backend, false for MCP and other callers.
+
+    Exempt:
+      * the static operator API token (via=api_token)
+      * a JWT minted by POST /token after that token was checked (via=operator)
+      * a subject listed in CRAWL4AI_TRUSTED_SUBJECTS
+
+    MCP OAuth tokens use sub mcp-client and do not carry via=operator, so
+    they keep the per-minute cap and the daily paid caps.
+    """
+    if not isinstance(principal, dict):
+        return False
+    if principal.get("via") in {"api_token", "operator"}:
+        return True
+    sub = str(principal.get("sub") or principal.get("email") or "").strip().lower()
+    return bool(sub) and sub in trusted_backend_subjects()
 
 
 def get_principal(request: Request) -> Optional[Dict]:

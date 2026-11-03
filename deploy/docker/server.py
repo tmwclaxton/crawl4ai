@@ -13,7 +13,7 @@ from crawl4ai.async_configs import Provenance, UntrustedConfigError
 from crawl4ai.__version__ import __version__
 from auth import (
     create_access_token, get_token_dependency, TokenRequest,
-    constant_time_eq, resolve_secret_key,
+    constant_time_eq, is_trusted_backend, resolve_secret_key,
 )
 from auth_gate import AuthGateMiddleware
 from pydantic import BaseModel
@@ -485,30 +485,39 @@ def _current_api_token() -> str:
 from mcp_oauth import OAUTH_PUBLIC_PATHS, OAUTH_PUBLIC_PREFIXES, attach_oauth
 
 # Added before AuthGate so it runs after auth has attached the principal.
-# Non-operator tokens get a tighter per-minute cap than the SlowAPI default,
-# which stays high enough for the GrantGunner operator token.
+# Untrusted JWT subjects (MCP and other callers) get a tighter per-minute
+# cap than the SlowAPI default. The operator API token, JWTs minted by
+# POST /token, and CRAWL4AI_TRUSTED_SUBJECTS are exempt so GrantGunner
+# (Scout, enrichment, autofill) is not capped with those callers.
+# This window is in-process, so each gunicorn worker counts its own hits.
 _TOKEN_RATE_WINDOW_S = 60
 _token_hits: Dict[str, list] = {}
 
 
-def _token_rate_limit(principal: Optional[Dict]) -> int:
+def _token_rate_limit() -> int:
+    """Per-minute cap for untrusted JWT subjects.
+
+    CRAWL4AI_TOKEN_RATE_PER_MINUTE defaults to 60. A negative value means
+    unlimited. A value that is not an integer falls back to 60. Trusted
+    backend callers never reach this function.
+    """
     raw = os.environ.get("CRAWL4AI_TOKEN_RATE_PER_MINUTE", "60")
     try:
-        other = int(raw)
+        limit = int(str(raw).strip())
     except ValueError:
-        other = 60
-    if isinstance(principal, dict) and principal.get("via") == "api_token":
-        op = os.environ.get("CRAWL4AI_OPERATOR_RATE_PER_MINUTE", "1200")
-        try:
-            return max(int(op), 1)
-        except ValueError:
-            return 1200
-    return max(other, 1)
+        limit = 60
+    if limit < 0:
+        return limit
+    return max(limit, 1)
 
 
 class TokenRateLimitMiddleware:
-    """Per-token request cap for JWT callers. The operator token keeps a
-    higher ceiling so the GrantGunner app is not throttled with MCP users."""
+    """Per-minute cap for untrusted JWT callers.
+
+    Exempt (no per-minute cap, and marked so the daily paid caps skip them):
+    the operator API token, a JWT with via=operator from POST /token, and
+    any subject in CRAWL4AI_TRUSTED_SUBJECTS.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -527,16 +536,20 @@ class TokenRateLimitMiddleware:
             return
         state = scope.get("state") or {}
         principal = state.get("principal") if isinstance(state, dict) else None
-        if not isinstance(principal, dict) or principal.get("via") == "api_token":
-            # Unauthenticated (already rejected by the gate) and the operator
-            # token use the SlowAPI limit only.
-            if isinstance(principal, dict):
-                usage_log.current_client.set(f"api_token:{principal.get('sub') or 'operator'}")
+        if not isinstance(principal, dict):
             await self.app(scope, receive, send)
             return
-        sub = str(principal.get("sub") or principal.get("email") or "jwt")
+        sub = str(principal.get("sub") or principal.get("email") or "caller")
+        if is_trusted_backend(principal):
+            # trusted: prefix tells allow_paid to skip the daily caps.
+            usage_log.current_client.set(f"trusted:{sub}")
+            await self.app(scope, receive, send)
+            return
         usage_log.current_client.set(f"jwt:{sub}")
-        limit = _token_rate_limit(principal)
+        limit = _token_rate_limit()
+        if limit < 0:
+            await self.app(scope, receive, send)
+            return
         now = time.time()
         bucket = _token_hits.setdefault(sub, [])
         cutoff = now - _TOKEN_RATE_WINDOW_S
@@ -727,7 +740,11 @@ async def get_token(req: TokenRequest):
         raise HTTPException(401, "Invalid or missing api_token")
     if not verify_email_domain(req.email):
         raise HTTPException(400, "Invalid email domain")
-    token = create_access_token({"sub": req.email})
+    # via=operator marks a JWT minted with the operator API token. GrantGunner
+    # swaps that token for this JWT and then calls the API with it. The rate
+    # limiter and the daily paid caps treat that subject as the trusted backend.
+    # MCP OAuth tokens are minted on a different path and do not get this claim.
+    token = create_access_token({"sub": req.email, "via": "operator"})
     return {"email": req.email, "access_token": token, "token_type": "bearer"}
 
 

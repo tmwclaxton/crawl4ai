@@ -11,6 +11,10 @@ How much you have to do scales with how much you drove through the API. A plain
 
 > Upgrading from a self-hosted server? Read this first, then roll out behind a
 > staging environment. See `SECURITY-VERIFY.md` for the deployment checklist.
+>
+> GrantGunner fork operators: read [UPGRADING](#upgrading)
+> before deploying the audit section C image. That section lists every changed
+> environment variable, the Redis migration, and the post-deploy checks.
 
 ---
 
@@ -238,3 +242,69 @@ messages are unchanged.
 - The `/dashboard` and `/playground` UIs get baseline headers
   (`nosniff`, `X-Frame-Options: DENY`) and are auth-gated; a stricter CSP for
   the UIs is planned in a follow-up.
+
+---
+
+## UPGRADING
+
+This section is for the self-hosted crawler GrantGunner calls at
+`http://crawl4ai:11235`. GrantGunner, the crawl4ai MCP, and gg-agents all use
+this server. GrantGunner posts the operator API token to `POST /token` and
+then sends the returned JWT on scrape and search calls.
+
+### Environment variables
+
+Set these in the shell or the project `.env` before `docker compose up`.
+Compose reads `.env` itself. A shell export wins over `.env`.
+
+| Variable | Default | What changed |
+| --- | --- | --- |
+| `CRAWL4AI_DISABLE_RATE_LIMITER` | `false` | The same-host crawl pause stays on (about 1 to 2 seconds per host). Set `true` only when a private batch job must turn that pause off. |
+| `CRAWL4AI_ALLOW_DEEP_CRAWL` | `false` | Deep crawl is rejected until this is `true`. |
+| `CRAWL4AI_PUBLIC_BASE_URL` | `https://crawl4ai.grantgunner.org` | Origin written into the MCP OAuth discovery documents. |
+| `CRAWL4AI_TOKEN_RATE_PER_MINUTE` | `60` | Per-minute cap for untrusted JWT subjects, counted separately in each gunicorn worker. A negative value means unlimited. The operator API token, JWTs from `POST /token` (`via=operator`), and `CRAWL4AI_TRUSTED_SUBJECTS` are exempt. |
+| `CRAWL4AI_TRUSTED_SUBJECTS` | empty | Comma-separated JWT subjects that skip the per-minute cap and the daily paid caps. Use this to name the backend email. Operator-issued JWTs are already exempt without it. |
+| `CRAWL4AI_DAILY_FIRECRAWL_CAP` | `500` | Daily Firecrawl calls per untrusted token. A negative value means unlimited. The trusted backend is exempt. |
+| `CRAWL4AI_DAILY_PROXY_CAP` | `1000` | Daily DataImpulse proxy calls per untrusted token. A negative value means unlimited. The trusted backend is exempt. |
+| `CRAWL4AI_DAILY_NANOGPT_CAP` | `5000` | Daily NanoGPT calls per untrusted token. A negative value means unlimited. The trusted backend is exempt. |
+| `CRAWL4AI_TRUSTED_HOSTS` | empty | Comma-separated extra `Host` names appended to `crawl4ai.grantgunner.org`, `crawl4ai`, `localhost`, `127.0.0.1`, and `testserver`. Add any other name a caller sends, or that caller receives HTTP 400. |
+| `REDIS_HOST` | `crawl4ai_redis` | DNS name of this stack's Redis. Do not set it to `redis`. |
+| `REDIS_PASSWORD` | none (required) | No default is shipped. `docker compose up` fails immediately with a clear message when this is unset or empty. |
+| `REDIS_MAXMEMORY` | `1gb` | Redis `maxmemory`. Eviction policy is `volatile-lru`. |
+| `GIT_SHA` | `unknown` | Build arg, not a runtime default you can omit safely. Export `GIT_SHA=$(git rev-parse HEAD)` before `docker compose build`. `/health` reports it as `git_sha`. `unknown` means the image was built without the arg. The image stores it as `CRAWL4AI_GIT_SHA`. |
+
+`mem_limit: 4g` is set on the crawl4ai service (and `deploy.resources.limits.memory: 4G`). That is compose configuration, not an environment variable.
+
+Decorated routes still have the SlowAPI ceiling of `1000/minute` per token. The exemption above is the extra 60/minute middleware and the daily paid caps.
+
+### Redis migration
+
+The service name stays `crawl4ai_redis`. Clients, including GrantGunner, keep using that host. This compose file owns that service. Do not run a second Redis that also answers as `crawl4ai_redis` on a shared network, and do not add a network alias named `redis`.
+
+The existing production `crawl4ai_redis` was passwordless. This file will not start until `REDIS_PASSWORD` is set, and it will not invent a password for you. Set the same value as Redis `requirepass` before the app container starts. If the app sends `AUTH` and Redis has no password, or the other way around, connections fail.
+
+Eviction is `volatile-lru` with `REDIS_MAXMEMORY` defaulting to `1gb` (previously `allkeys-lru` at 256mb). Only keys that already have a TTL can be evicted, and only after maxmemory is reached. Job hashes use `task_ttl_seconds` (default 3600). Keys without a TTL, including monitors and the usage log, are kept. Raise `REDIS_MAXMEMORY` when stored crawl results are large.
+
+Redis data is stored in the named volume `crawl4ai_redis_data`. A volume created on the first boot with this file does not contain an older container's data directory. In-flight job keys expire within the task TTL. Attach the old data directory yourself before the first `up` if those keys must survive the recreate.
+
+The image entrypoint refuses `REDIS_HOST=redis`. When the host is not loopback, it also refuses to start without `REDIS_PASSWORD`. The single-container image, whose Redis is on 127.0.0.1, still generates an ephemeral password for that bundled instance when none was provided.
+
+### Breaking changes
+
+* MCP OAuth refresh tokens last 7 days. They previously lasted 30 days. A client whose refresh token is older than 7 days must sign in again. Access tokens stay at 60 minutes.
+* Deep crawl is off unless `CRAWL4AI_ALLOW_DEEP_CRAWL=true`. A request that sets `deep_crawl_strategy` otherwise returns HTTP 400.
+* Fetch paths reject internal targets before any request is sent. Blocked targets include `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.169.254`, link-local, IPv6 equivalents, names with no dot such as `grantgunner-app-1` and `redis`, and suffixes such as `.internal`, `.local`, and `.docker`. Search checks each redirect hop. A private DNS answer is also rejected.
+
+### Edge proxy
+
+`deploy/docker/nginx-edge.conf` is not applied by this compose file. The live edge proxy has to pick it up separately. The directives that matter are `proxy_read_timeout 330s` and `client_max_body_size 10m`.
+
+### Post-deploy checklist
+
+* `POST /token` with the operator API token returns a JWT, and that JWT's `via` claim is `operator`.
+* A GrantGunner scrape succeeds.
+* A GrantGunner search succeeds.
+* 60 or more requests per minute from the backend subject do not return 429. The backend subject is the JWT from `POST /token`, or a subject listed in `CRAWL4AI_TRUSTED_SUBJECTS`.
+* An unrelated JWT subject still receives 429 after `CRAWL4AI_TOKEN_RATE_PER_MINUTE` requests in a minute.
+* `GET /health` reports a `git_sha` that matches the commit you built.
+* Redis answers `AUTH` with the password you set (`redis-cli -a "$REDIS_PASSWORD" ping` inside the Redis container returns `PONG`).
