@@ -86,9 +86,17 @@ setup_logging(config)
 
 # Version is imported from crawl4ai package to ensure it stays in sync
 
-# ── global page semaphore (hard cap) ─────────────────────────
+# ── global page semaphore (hard cap) + stuck-aware tracking ──
 MAX_PAGES = config["crawler"]["pool"].get("max_pages", 30)
-GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
+from concurrency_guard import (
+    init_guard,
+    get_guard,
+    request_hard_timeout,
+    resolve_hard_timeout,
+)
+GUARD = init_guard(MAX_PAGES)
+# Back-compat alias: older code / tests may still import GLOBAL_SEM.
+GLOBAL_SEM = GUARD._sem
 
 # ── security feature flags ───────────────────────────────────
 # Hooks are disabled by default for security (RCE risk). Set to "true" to enable.
@@ -141,25 +149,31 @@ def get_default_browser_config() -> BrowserConfig:
     enforce_egress(bc)
     return bc
 
-# import logging
-# page_log = logging.getLogger("page_cap")
-# orig_arun = AsyncWebCrawler.arun
-# async def capped_arun(self, *a, **kw):
-#     await GLOBAL_SEM.acquire()                        # ← take slot
-#     try:
-#         in_flight = MAX_PAGES - GLOBAL_SEM._value     # used permits
-#         page_log.info("🕸️  pages_in_flight=%s / %s", in_flight, MAX_PAGES)
-#         return await orig_arun(self, *a, **kw)
-#     finally:
-#         GLOBAL_SEM.release()                          # ← free slot
-
 orig_arun = AsyncWebCrawler.arun
 
 
 async def capped_arun(self, *a, **kw):
-    async with GLOBAL_SEM:
+    """Take a GLOBAL_SEM slot, bound the crawl, always release the slot.
+
+    Slot release does not wait for Playwright cancellation to finish — that
+    was the Nov 2026 leak when a stalled proxy ignored CancelledError.
+    """
+    guard = get_guard()
+
+    async def _work():
         return await orig_arun(self, *a, **kw)
+
+    return await guard.run(_work, crawler=self)
+
+
 AsyncWebCrawler.arun = capped_arun
+
+
+def _apply_request_timeout(body) -> None:
+    """Push an optional per-request hard_timeout_seconds into the ContextVar."""
+    override = getattr(body, "hard_timeout_seconds", None)
+    if override is not None:
+        request_hard_timeout.set(float(override))
 
 
 def _install_pdf_egress_policy() -> None:
@@ -423,6 +437,29 @@ _setup_security(app)
 
 if config["observability"]["prometheus"]["enabled"]:
     Instrumentator().instrument(app).expose(app)
+    try:
+        from prometheus_client import Gauge
+
+        Gauge(
+            "crawl4ai_in_flight",
+            "Crawls holding a concurrency slot",
+        ).set_function(lambda: get_guard().in_flight)
+        Gauge(
+            "crawl4ai_queued",
+            "Crawls waiting for a concurrency slot",
+        ).set_function(lambda: get_guard().queued)
+        Gauge(
+            "crawl4ai_slots_free",
+            "Free concurrency slots",
+        ).set_function(lambda: get_guard().slots_free)
+        Gauge(
+            "crawl4ai_oldest_in_flight_seconds",
+            "Age in seconds of the oldest in-flight crawl",
+        ).set_function(lambda: get_guard().snapshot()["oldest_in_flight_seconds"])
+    except Exception:
+        logging.getLogger("crawl4ai.concurrency").debug(
+            "prometheus concurrency gauges not registered", exc_info=True
+        )
 
 token_dep = get_token_dependency(config)
 
@@ -807,10 +844,16 @@ async def get_markdown(
                 })
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
+    _apply_request_timeout(body)
     try:
         budget = float(os.environ.get("MD_TOTAL_BUDGET_S", "28"))
     except ValueError:
         budget = 28.0
+    # Cap the md budget by the hard crawl timeout so a hung browser cannot
+    # outlive the process-wide deadline even when MD_TOTAL_BUDGET_S is larger.
+    hard = resolve_hard_timeout()
+    if budget <= 0 or budget > hard:
+        budget = hard
     try:
         markdown, md_source = await asyncio.wait_for(
             handle_markdown_request(
@@ -854,6 +897,7 @@ async def generate_html(
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
     validate_url_scheme(body.url, allow_raw=True)
+    _apply_request_timeout(body)
     cfg = CrawlerRunConfig()
     crawler = None
     try:
@@ -866,6 +910,10 @@ async def generate_html(
         from crawl4ai.utils import preprocess_html_for_schema
         processed_html = preprocess_html_for_schema(raw_html)
         return JSONResponse({"html": processed_html, "url": body.url, "success": True})
+    except asyncio.TimeoutError as e:
+        raise HTTPException(504, detail=str(e) or "Crawl exceeded the time limit") from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, detail=str(e))
     finally:
@@ -955,6 +1003,7 @@ async def generate_screenshot(
     sandboxed artifact store; the response includes an `artifact_id` and a `url` to fetch it.
     """
     validate_url_scheme(body.url)
+    _apply_request_timeout(body)
     # model_dump, not attribute access: the field is marked deprecated and
     # reading the attribute emits DeprecationWarning on every request.
     legacy_output_path = body.model_dump(include={"output_path"}).get("output_path")
@@ -971,6 +1020,8 @@ async def generate_screenshot(
         if legacy_output_path:
             response["warning"] = _OUTPUT_PATH_WARNING
         return response
+    except asyncio.TimeoutError as e:
+        raise HTTPException(504, detail=str(e) or "Crawl exceeded the time limit") from e
     except HTTPException:
         raise
     except Exception as e:
@@ -996,6 +1047,7 @@ async def generate_pdf(
     sandboxed artifact store; the response includes an `artifact_id` and a `url` to fetch it.
     """
     validate_url_scheme(body.url)
+    _apply_request_timeout(body)
     # model_dump, not attribute access: the field is marked deprecated and
     # reading the attribute emits DeprecationWarning on every request.
     legacy_output_path = body.model_dump(include={"output_path"}).get("output_path")
@@ -1012,6 +1064,8 @@ async def generate_pdf(
         if legacy_output_path:
             response["warning"] = _OUTPUT_PATH_WARNING
         return response
+    except asyncio.TimeoutError as e:
+        raise HTTPException(504, detail=str(e) or "Crawl exceeded the time limit") from e
     except HTTPException:
         raise
     except Exception as e:
@@ -1077,6 +1131,7 @@ async def execute_js(
     if not EXECUTE_JS_ENABLED:
         raise HTTPException(403, "execute_js endpoint is disabled. Set CRAWL4AI_EXECUTE_JS_ENABLED=true to enable.")
     validate_url_scheme(body.url)
+    _apply_request_timeout(body)
     # Block SSRF: reject internal/private IPs
     try:
         validate_webhook_url(body.url)  # reuse SSRF blocklist
@@ -1091,6 +1146,10 @@ async def execute_js(
             raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
         data = results[0].model_dump()
         return JSONResponse(data)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(504, detail=str(e) or "Crawl exceeded the time limit") from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, detail=str(e))
     finally:
@@ -1149,12 +1208,31 @@ async def get_hooks_info():
 async def health():
     # CRAWL4AI_GIT_SHA is baked into the image at build time. "unknown" means
     # the image was built without the label, which is itself deploy drift.
-    return {
-        "status": "ok",
+    #
+    # Stuck-aware: when in-flight crawls / full slots / queued-with-no-progress
+    # exceed thresholds, return HTTP 503 so Docker HEALTHCHECK (curl -f) fails
+    # and the container can be restarted. Healthy responses keep status "ok"
+    # and the original fields; concurrency counters are always included.
+    assessment = get_guard().health_assessment()
+    body = {
+        "status": "ok" if assessment["healthy"] else "unhealthy",
         "timestamp": time.time(),
         "version": __version__,
         "git_sha": os.environ.get("CRAWL4AI_GIT_SHA", "unknown"),
+        "in_flight": assessment["in_flight"],
+        "queued": assessment["queued"],
+        "oldest_in_flight_seconds": assessment["oldest_in_flight_seconds"],
+        "last_completed_at": assessment["last_completed_at"],
+        "slots_total": assessment["slots_total"],
+        "slots_free": assessment["slots_free"],
+        "seconds_since_last_completion": assessment["seconds_since_last_completion"],
+        "slots_full_for_seconds": assessment["slots_full_for_seconds"],
+        "hard_timeout_seconds": assessment["hard_timeout_seconds"],
     }
+    if not assessment["healthy"]:
+        body["reasons"] = assessment["reasons"]
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 @app.get(config["observability"]["prometheus"]["endpoint"])
@@ -1177,6 +1255,7 @@ async def crawl(
     """
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
+    _apply_request_timeout(crawl_request)
     if crawl_request.hooks and not HOOKS_ENABLED:
         _reject_disabled_hooks(crawl_request.hooks)
     if crawl_request.site_profile is not None:
@@ -1268,6 +1347,7 @@ async def crawl_stream(
 ):
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
+    _apply_request_timeout(crawl_request)
     if crawl_request.hooks and not HOOKS_ENABLED:
         _reject_disabled_hooks(crawl_request.hooks)
     if crawl_request.site_profile is not None:

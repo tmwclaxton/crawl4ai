@@ -39,11 +39,21 @@ def test_md_budget_times_out(monkeypatch, server_module, caplog):
     assert body.url in caplog.text
 
 
-@pytest.mark.parametrize("value, expected_timeout", [("invalid", 28), ("0", None), ("-1", None)])
+@pytest.mark.parametrize(
+    "value, expected_timeout",
+    [
+        ("invalid", 28),
+        # 0 / negative no longer means unbounded: fall back to the hard timeout.
+        ("0", 120.0),
+        ("-1", 120.0),
+    ],
+)
 def test_md_budget_configuration(monkeypatch, server_module, value, expected_timeout):
     import page_cache
 
     monkeypatch.setenv("MD_TOTAL_BUDGET_S", value)
+    monkeypatch.setenv("CRAWL_HARD_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("CRAWL_HARD_TIMEOUT_MAX_SECONDS", "300")
     monkeypatch.setattr(page_cache, "cache_enabled", lambda: False)
     timeouts = []
 

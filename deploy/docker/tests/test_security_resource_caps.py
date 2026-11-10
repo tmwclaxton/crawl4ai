@@ -99,11 +99,14 @@ class TestConfigCaps:
         from governor import job_queue_caps, wall_clock_seconds
         caps = job_queue_caps({"limits": {"queue": {"maxsize": 0, "per_principal": 0}}})
         assert caps["maxsize"] == 0 and caps["per_principal"] == 0
-        assert wall_clock_seconds({}) == 0  # no deadline by default
+        # Wall-clock is always bounded now (CRAWL_HARD_TIMEOUT_SECONDS default).
+        assert wall_clock_seconds({}) > 0
 
-    def test_wall_clock_configurable(self):
+    def test_wall_clock_uses_hard_timeout_env(self, monkeypatch):
         from governor import wall_clock_seconds
-        assert wall_clock_seconds({"limits": {"wall_clock_s": 30}}) == 30
+        monkeypatch.setenv("CRAWL_HARD_TIMEOUT_SECONDS", "45")
+        monkeypatch.setenv("CRAWL_HARD_TIMEOUT_MAX_SECONDS", "300")
+        assert wall_clock_seconds({"limits": {"wall_clock_s": 30}}) == 45
 
 
 @pytest.mark.asyncio

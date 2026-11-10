@@ -4,6 +4,19 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 from utils import FilterType
 
 
+def _hard_timeout_field() -> Any:
+    """Optional per-request override for CRAWL_HARD_TIMEOUT_SECONDS."""
+    return Field(
+        default=None,
+        gt=0,
+        description=(
+            "Optional wall-clock timeout for this request, in seconds. "
+            "Capped by CRAWL_HARD_TIMEOUT_MAX_SECONDS (default 300). "
+            "When omitted, CRAWL_HARD_TIMEOUT_SECONDS (default 120) applies."
+        ),
+    )
+
+
 class CrawlRequest(BaseModel):
     urls: List[str] = Field(min_length=1, max_length=100)
     browser_config: Optional[Dict] = Field(default_factory=dict)
@@ -25,6 +38,7 @@ class CrawlRequest(BaseModel):
             "Omit for the default behaviour."
         ),
     )
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
 
 
 class HookSpec(BaseModel):
@@ -89,6 +103,7 @@ class MarkdownRequest(BaseModel):
     temperature: Optional[float] = Field(None, description="LLM temperature override (0.0-2.0)")
     # base_url removed: a request-supplied LLM endpoint was a credential-exfil
     # vector. The endpoint is derived server-side from the provider name.
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
 
 
 class RawCode(BaseModel):
@@ -96,7 +111,8 @@ class RawCode(BaseModel):
 
 class HTMLRequest(BaseModel):
     url: str
-    
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
+
 class ScreenshotRequest(BaseModel):
     url: str
     screenshot_wait_for: Optional[float] = 2
@@ -111,6 +127,7 @@ class ScreenshotRequest(BaseModel):
             "stored server-side; fetch via GET /artifacts/{artifact_id}."
         ),
     )
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
 
 
 class PDFRequest(BaseModel):
@@ -124,6 +141,7 @@ class PDFRequest(BaseModel):
             "stored server-side; fetch via GET /artifacts/{artifact_id}."
         ),
     )
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
 
 
 class ScrapeRequest(BaseModel):
@@ -224,6 +242,7 @@ class JSEndpointRequest(BaseModel):
         ...,
         description="List of separated JavaScript snippets to execute"
     )
+    hard_timeout_seconds: Optional[float] = _hard_timeout_field()
 
 
 class WebhookConfig(BaseModel):
