@@ -41,6 +41,14 @@ x-base-config: &base-config
     - CRAWL4AI_DAILY_FIRECRAWL_CAP=${CRAWL4AI_DAILY_FIRECRAWL_CAP:-500}
     - CRAWL4AI_DAILY_PROXY_CAP=${CRAWL4AI_DAILY_PROXY_CAP:-1000}
     - CRAWL4AI_DAILY_NANOGPT_CAP=${CRAWL4AI_DAILY_NANOGPT_CAP:-5000}
+    # Hard wall-clock timeout per crawl slot. On timeout the slot is released
+    # even if the browser task ignores cancellation (prevents the Nov 2026 leak).
+    - CRAWL_HARD_TIMEOUT_SECONDS=${CRAWL_HARD_TIMEOUT_SECONDS:-120}
+    - CRAWL_HARD_TIMEOUT_MAX_SECONDS=${CRAWL_HARD_TIMEOUT_MAX_SECONDS:-300}
+    # Stuck-aware /health (HTTP 503 when true so Docker HEALTHCHECK fails).
+    - CRAWL_HEALTH_STUCK_SECONDS=${CRAWL_HEALTH_STUCK_SECONDS:-240}
+    - CRAWL_HEALTH_NO_COMPLETION_SECONDS=${CRAWL_HEALTH_NO_COMPLETION_SECONDS:-180}
+    - CRAWL_HEALTH_SLOTS_FULL_SECONDS=${CRAWL_HEALTH_SLOTS_FULL_SECONDS:-240}
     # Uncomment to set default environment variables (will overwrite .llm.env)
     # - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     # - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}

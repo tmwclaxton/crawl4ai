@@ -133,8 +133,19 @@ def _limits(config: dict) -> dict:
 
 
 def wall_clock_seconds(config: dict) -> float:
-    """Per-crawl wall-clock deadline in seconds; 0 (default) => no deadline."""
-    return float(_limits(config).get("wall_clock_s", 0) or 0)
+    """Per-crawl wall-clock deadline in seconds.
+
+    Prefer CRAWL_HARD_TIMEOUT_SECONDS (via concurrency_guard.resolve_hard_timeout)
+    so every endpoint shares one knobs set. config limits.wall_clock_s remains a
+    fallback when the env/default path is unavailable; 0 in config alone no
+    longer disables the deadline (hung crawls must always be bounded).
+    """
+    try:
+        from concurrency_guard import resolve_hard_timeout
+        return resolve_hard_timeout()
+    except Exception:
+        configured = float(_limits(config).get("wall_clock_s", 0) or 0)
+        return configured if configured > 0 else 120.0
 
 
 def job_queue_caps(config: dict) -> dict:

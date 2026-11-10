@@ -1208,9 +1208,10 @@ async def handle_crawl_request(
             pass
         raise HTTPException(status_code=400, detail=f"Rejected request: {e}")
 
-    except asyncio.TimeoutError:
-        # Per-crawl wall-clock deadline exceeded.
-        raise HTTPException(status_code=504, detail="Crawl exceeded the time limit")
+    except asyncio.TimeoutError as e:
+        # Per-crawl wall-clock / hard timeout exceeded.
+        detail = str(e) if str(e) else "Crawl exceeded the time limit"
+        raise HTTPException(status_code=504, detail=detail)
 
     except HTTPException:
         # Deliberate status (e.g. 400 SSRF "URL blocked") must pass through
@@ -1331,14 +1332,14 @@ async def handle_stream_crawl_request(
 
         # Deep crawl with single URL: use arun() which returns an async generator
         # mirroring the Python library's streaming behavior
+        from governor import wall_clock_seconds
+        _stream_deadline = wall_clock_seconds(config)
+
         if crawler_config.deep_crawl_strategy is not None and len(urls) == 1:
             results_gen = await crawler.arun(
                 urls[0],
                 config=crawler_config,
             )
-            from governor import wall_clock_seconds
-            if wall_clock_seconds(config) > 0:
-                results_gen = _with_deadline(results_gen, wall_clock_seconds(config))
         else:
             # Default multi-URL streaming via arun_many. Same pause switch as
             # the non-streaming path, so CRAWL4AI_DISABLE_RATE_LIMITER means
@@ -1360,6 +1361,11 @@ async def handle_stream_crawl_request(
                 config=config_list or crawler_config,
                 dispatcher=dispatcher
             )
+
+        # Bound every stream (deep-crawl and multi-URL) so a stalled page cannot
+        # hold the response open indefinitely.
+        if _stream_deadline and _stream_deadline > 0:
+            results_gen = _with_deadline(results_gen, _stream_deadline)
 
         if refused:
             results_gen = _prepend_results(refused, results_gen)
