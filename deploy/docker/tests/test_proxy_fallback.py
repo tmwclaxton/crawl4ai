@@ -9,7 +9,11 @@ from proxy_fallback import (
     apply_proxy_result,
     configured_tiers,
     fill_failed_with_proxy,
+    fill_with_proxy_tier,
+    forced_tier_placeholders,
+    normalize_proxy_tier,
     proxy_fallback_enabled,
+    proxy_url_for_tier,
     skip_paid_proxy,
 )
 
@@ -204,3 +208,140 @@ def test_apply_proxy_result_sets_provider():
     apply_proxy_result(result, {"url": "https://a.example/", "success": True, "markdown": "hi"}, "premium")
     assert result["metadata"]["provider"] == "crawl4ai-premium"
     assert result["markdown"] == "hi"
+
+
+def test_normalize_proxy_tier_aliases():
+    assert normalize_proxy_tier(None) is None
+    assert normalize_proxy_tier("") is None
+    assert normalize_proxy_tier("  ") is None
+    assert normalize_proxy_tier("residential") == "residential"
+    assert normalize_proxy_tier("crawl4ai_residential") == "residential"
+    assert normalize_proxy_tier("crawl4ai-residential") == "residential"
+    assert normalize_proxy_tier("DATACENTER") == "datacenter"
+    assert normalize_proxy_tier("premium") == "premium"
+    try:
+        normalize_proxy_tier("unknown")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_forced_tier_placeholders_skip_local():
+    rows = forced_tier_placeholders(["https://blocked.example/"], "residential")
+    assert rows[0]["success"] is False
+    assert "skipped the local browser" in rows[0]["error_message"]
+
+
+def test_fill_with_proxy_tier_uses_only_requested_tier(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch)
+    seen = []
+
+    async def crawl(url: str):
+        host, port, auth = egress_proxy.upstream_proxy()
+        import base64
+        user = base64.b64decode(auth.split(b" ")[-1].strip()).split(b":")[0].decode()
+        seen.append(user)
+        return {"url": url, "success": True, "markdown": "ok via residential"}
+
+    results = asyncio.run(
+        fill_with_proxy_tier(
+            [{"url": "https://blocked.example/", "success": False}],
+            crawl,
+            "residential",
+        )
+    )
+    assert seen == ["res-user"]
+    assert results[0]["metadata"]["provider"] == "crawl4ai-residential"
+    assert results[0]["success"] is True
+    assert results[0]["markdown"] == "ok via residential"
+
+
+def test_fill_with_proxy_tier_does_not_fall_back_to_other_tiers(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch)
+    seen = []
+
+    async def crawl(url: str):
+        host, port, auth = egress_proxy.upstream_proxy()
+        import base64
+        user = base64.b64decode(auth.split(b" ")[-1].strip()).split(b":")[0].decode()
+        seen.append(user)
+        return {"url": url, "success": False, "markdown": ""}
+
+    results = asyncio.run(
+        fill_with_proxy_tier(
+            [{"url": "https://blocked.example/", "success": False}],
+            crawl,
+            "residential",
+        )
+    )
+    assert seen == ["res-user"]
+    assert results[0]["success"] is False
+    assert "residential" in results[0]["error_message"]
+
+
+def test_fill_with_proxy_tier_when_tier_missing(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch, residential=False)
+
+    async def boom(url: str):
+        raise AssertionError(url)
+
+    results = asyncio.run(
+        fill_with_proxy_tier(
+            [{"url": "https://blocked.example/", "success": False}],
+            boom,
+            "residential",
+        )
+    )
+    assert results[0]["success"] is False
+    assert "not configured" in results[0]["error_message"]
+
+
+def test_fill_with_proxy_tier_runs_when_fallback_flag_is_off(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch)
+    monkeypatch.setenv("CRAWL4AI_PROXY_FALLBACK", "false")
+    seen = []
+
+    async def crawl(url: str):
+        seen.append(url)
+        return {"url": url, "success": True, "markdown": "forced"}
+
+    results = asyncio.run(
+        fill_with_proxy_tier(
+            [{"url": "https://blocked.example/", "success": False}],
+            crawl,
+            "residential",
+        )
+    )
+    assert seen == ["https://blocked.example/"]
+    assert results[0]["metadata"]["provider"] == "crawl4ai-residential"
+
+
+def test_fill_with_proxy_tier_skips_image_serp(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch)
+
+    async def boom(url: str):
+        raise AssertionError(url)
+
+    results = asyncio.run(
+        fill_with_proxy_tier(
+            [{"url": "https://duckduckgo.com/?q=grant&ia=images", "success": False}],
+            boom,
+            "residential",
+        )
+    )
+    assert results[0]["success"] is False
+
+
+def test_proxy_url_for_tier_picks_matching_credentials(monkeypatch):
+    _clear_dataimpulse(monkeypatch)
+    _set_tiers(monkeypatch)
+    url = proxy_url_for_tier("residential")
+    assert url is not None
+    assert url.startswith("http://")
+    assert "res-user" in url
+    assert proxy_url_for_tier("missing") is None

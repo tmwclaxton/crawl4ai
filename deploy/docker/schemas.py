@@ -39,6 +39,21 @@ class CrawlRequest(BaseModel):
         ),
     )
     hard_timeout_seconds: Optional[float] = _hard_timeout_field()
+    proxy_tier: Optional[str] = Field(
+        default=None,
+        description=(
+            "If set (datacenter, residential, or premium), skip the local "
+            "browser and crawl only through that DataImpulse tier. Aliases "
+            "such as crawl4ai_residential are accepted."
+        ),
+    )
+
+    @field_validator("proxy_tier")
+    @classmethod
+    def validate_proxy_tier(cls, value: Optional[str]) -> Optional[str]:
+        from proxy_fallback import normalize_proxy_tier
+
+        return normalize_proxy_tier(value)
 
 
 class HookSpec(BaseModel):

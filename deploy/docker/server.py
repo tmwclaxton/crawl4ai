@@ -1324,6 +1324,7 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        proxy_tier=crawl_request.proxy_tier,
         **({"site_profile": crawl_request.site_profile} if crawl_request.site_profile is not None else {}),
     )
     if cache_url is not None and page_cache.writes_cache(cache_mode):
