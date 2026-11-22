@@ -985,6 +985,7 @@ async def handle_crawl_request(
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
     site_profile: Optional[str] = None,
+    proxy_tier: Optional[str] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -1074,32 +1075,41 @@ async def handle_crawl_request(
         from firecrawl_fallback import apply_page_timeout_cap
         apply_page_timeout_cap(effective_config)
 
-        from proxy_fallback import partition_cloudflare_hosts
-        urls, cloudflare_urls = partition_cloudflare_hosts(urls)
+        from proxy_fallback import (
+            cloudflare_placeholders,
+            forced_tier_placeholders,
+            normalize_proxy_tier,
+            partition_cloudflare_hosts,
+        )
+        requested_tier = normalize_proxy_tier(proxy_tier)
         results = []
-        # Known Cloudflare hosts skip the local browser and are filled by the
-        # proxy fallback below. arun takes one config, so a per-URL list goes
-        # to arun_many even for a single URL.
-        if urls:
-            use_many = len(urls) > 1 or isinstance(effective_config, list)
-            func = getattr(crawler, "arun_many" if use_many else "arun")
-            partial_func = partial(func,
-                                    urls if use_many else urls[0],
-                                    config=effective_config,
-                                    dispatcher=dispatcher)
-            # Optional per-crawl wall-clock deadline (config limits.wall_clock_s; 0 = none).
-            from governor import wall_clock_seconds
-            _deadline = wall_clock_seconds(config)
-            if _deadline and _deadline > 0:
-                results = await asyncio.wait_for(partial_func(), timeout=_deadline)
-            else:
-                results = await partial_func()
+        # An explicit proxy_tier skips the local browser entirely. Known
+        # Cloudflare hosts also skip it and are filled by the proxy fallback
+        # below. arun takes one config, so a per-URL list goes to arun_many
+        # even for a single URL.
+        if requested_tier:
+            results = refused + forced_tier_placeholders(urls, requested_tier)
+        else:
+            urls, cloudflare_urls = partition_cloudflare_hosts(urls)
+            if urls:
+                use_many = len(urls) > 1 or isinstance(effective_config, list)
+                func = getattr(crawler, "arun_many" if use_many else "arun")
+                partial_func = partial(func,
+                                        urls if use_many else urls[0],
+                                        config=effective_config,
+                                        dispatcher=dispatcher)
+                # Optional per-crawl wall-clock deadline (config limits.wall_clock_s; 0 = none).
+                from governor import wall_clock_seconds
+                _deadline = wall_clock_seconds(config)
+                if _deadline and _deadline > 0:
+                    results = await asyncio.wait_for(partial_func(), timeout=_deadline)
+                else:
+                    results = await partial_func()
 
-        # Ensure results is always a list
-        if not isinstance(results, list):
-            results = [results]
-        from proxy_fallback import cloudflare_placeholders
-        results = refused + results + cloudflare_placeholders(cloudflare_urls)
+            # Ensure results is always a list
+            if not isinstance(results, list):
+                results = [results]
+            results = refused + results + cloudflare_placeholders(cloudflare_urls)
 
         end_mem_mb = _get_memory_mb() # <--- Get memory after
         end_time = time.time()
@@ -1148,8 +1158,9 @@ async def handle_crawl_request(
                     "error_message": str(e)
                 })
 
-        from proxy_fallback import fill_failed_with_proxy, mark_cloudflare_results
-        processed_results = mark_cloudflare_results(processed_results)
+        from proxy_fallback import fill_failed_with_proxy, fill_with_proxy_tier, mark_cloudflare_results
+        if not requested_tier:
+            processed_results = mark_cloudflare_results(processed_results)
 
         async def _proxy_retry(url: str):
             retry_config = effective_config[0] if isinstance(effective_config, list) else effective_config
@@ -1168,10 +1179,16 @@ async def handle_crawl_request(
                 dumped["pdf"] = b64encode(dumped["pdf"]).decode("utf-8")
             return dumped
 
-        processed_results = await fill_failed_with_proxy(processed_results, _proxy_retry)
-
-        from firecrawl_fallback import fill_failed_results
-        processed_results = await fill_failed_results(processed_results)
+        if requested_tier:
+            # Forced hop: only the requested tier. Firecrawl stays with the
+            # caller (GrantGunner) as the hop after this one.
+            processed_results = await fill_with_proxy_tier(
+                processed_results, _proxy_retry, requested_tier
+            )
+        else:
+            processed_results = await fill_failed_with_proxy(processed_results, _proxy_retry)
+            from firecrawl_fallback import fill_failed_results
+            processed_results = await fill_failed_results(processed_results)
 
         response = {
             "success": True,

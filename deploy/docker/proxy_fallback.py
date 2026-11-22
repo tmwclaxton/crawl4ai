@@ -129,6 +129,49 @@ def configured_tiers() -> List[Tuple[str, str]]:
     return tiers
 
 
+def normalize_proxy_tier(value: Optional[str]) -> Optional[str]:
+    """Return datacenter, residential, or premium, or None when unset.
+
+    Accepts the same aliases GrantGunner sends (crawl4ai_residential,
+    crawl4ai-residential). Raises ValueError for any other non-empty value
+    so /crawl can reject a typo with HTTP 422 instead of ignoring it.
+    """
+    if value is None:
+        return None
+    tier = value.strip().lower().replace("-", "_")
+    if not tier:
+        return None
+    if tier.startswith("crawl4ai_"):
+        tier = tier[len("crawl4ai_"):]
+    known = {name for name, _, _ in _TIERS}
+    if tier not in known:
+        raise ValueError(
+            f"proxy_tier must be one of: {', '.join(sorted(known))}"
+        )
+    return tier
+
+
+def forced_tier_placeholders(urls: List[str], tier: str) -> list:
+    """Failed results so a /crawl with proxy_tier skips the local browser."""
+    return [
+        {
+            "url": url,
+            "success": False,
+            "html": "",
+            "error_message": f"Requested DataImpulse {tier} hop; skipped the local browser",
+        }
+        for url in urls
+    ]
+
+
+def proxy_url_for_tier(tier: str) -> Optional[str]:
+    for name, proxy_url in configured_tiers():
+        if name == tier:
+            return proxy_url
+    return None
+
+
+
 def apply_proxy_result(result: dict, recovered: dict, tier: str) -> None:
     result.clear()
     result.update(recovered)
@@ -178,4 +221,58 @@ async def fill_failed_with_proxy(
             apply_proxy_result(result, recovered, name)
             logger.warning("DataImpulse %s recovered %s", name, url)
             break
+    return results
+
+
+async def fill_with_proxy_tier(
+    results: list,
+    crawl: Callable[[str], Awaitable[Optional[dict]]],
+    tier: str,
+) -> list:
+    """Crawl failed results through one DataImpulse tier only.
+
+    Used when /crawl is given proxy_tier, so the hop never falls back to
+    the local browser or to a cheaper/other tier. An explicit proxy_tier
+    still runs when CRAWL4AI_PROXY_FALLBACK is off, as long as that tier
+    is configured.
+    """
+    from egress_proxy import use_request_upstream
+
+    proxy_url = proxy_url_for_tier(tier)
+    if not proxy_url:
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            result["success"] = False
+            result["error_message"] = f"DataImpulse {tier} is not configured"
+        return results
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if not result_needs_fallback(result):
+            continue
+        url = result.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        if skip_paid_proxy(url):
+            continue
+        import usage_log
+        if not await usage_log.allow_paid("proxy"):
+            logger.warning("DataImpulse daily cap spent; leaving %s unchanged", url)
+            continue
+        recovered = None
+        try:
+            logger.warning("DataImpulse %s forced hop retrying %s", tier, url)
+            async with use_request_upstream(proxy_url):
+                recovered = await crawl(url)
+        except Exception:
+            logger.warning("DataImpulse %s forced hop failed for %s", tier, url, exc_info=True)
+        if not isinstance(recovered, dict) or result_needs_fallback(recovered):
+            logger.warning("DataImpulse %s forced hop still blocked %s", tier, url)
+            result["success"] = False
+            result["error_message"] = f"DataImpulse {tier} hop failed"
+            continue
+        apply_proxy_result(result, recovered, tier)
+        logger.warning("DataImpulse %s forced hop recovered %s", tier, url)
     return results
